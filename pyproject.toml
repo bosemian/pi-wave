@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pi-wave"
+version = "0.1.0"
+description = "Wave orchestrator for pi coding agents — delegate-wave engine over pi RPC mode"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+pi-wave = "pi_wave.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pi_wave"]

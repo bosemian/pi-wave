@@ -1,0 +1,40 @@
+{
+  "name": "pi-wave-self-tour",
+  "cwd": ".",
+  "on_failure": "stop",
+  "display": "herdr",
+  "waves": [
+    [
+      {
+        "name": "wave-1-map",
+        "prompt": "Read the Python sources under src/pi_wave/ in this directory and describe each module's responsibility in 1-3 sentences. Read-only: do not modify any file.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "every module in src/pi_wave/ is described",
+        "timeout": 300
+      },
+      {
+        "name": "wave-1-readme",
+        "prompt": "Read README.md in this directory and summarize: what problem this tool solves, how a wave plan is structured, and the two safety mechanisms it enforces. Read-only: do not modify any file.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "summary covers problem, plan schema, and safety mechanisms",
+        "timeout": 300
+      }
+    ],
+    [
+      {
+        "name": "wave-2-synthesize",
+        "prompt": "You are given reports from two earlier agents (injected below). Write one combined orientation guide (max 200 words) for a new contributor to this repository. Read-only: do not modify any file.",
+        "model": "openai-codex/gpt-5.6-sol",
+        "thinking": "high",
+        "files": [],
+        "done_when": "one coherent guide that merges both reports",
+        "timeout": 300,
+        "needs_results": ["wave-1-map", "wave-1-readme"]
+      }
+    ]
+  ]
+}

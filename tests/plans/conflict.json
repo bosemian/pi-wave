@@ -1,0 +1,25 @@
+{
+  "name": "conflict-must-be-rejected",
+  "cwd": ".",
+  "on_failure": "stop",
+  "waves": [
+    [
+      {
+        "name": "wave-1-a",
+        "prompt": "Read-only test assignment.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": ["README.md"],
+        "timeout": 120
+      },
+      {
+        "name": "wave-1-b",
+        "prompt": "Read-only test assignment.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": ["README.md"],
+        "timeout": 120
+      }
+    ]
+  ]
+}

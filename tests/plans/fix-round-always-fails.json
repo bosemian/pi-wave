@@ -1,0 +1,30 @@
+{
+  "name": "fix-round-always-fails",
+  "cwd": ".",
+  "on_failure": "stop",
+  "waves": [
+    [
+      {
+        "name": "wave-1-fixer",
+        "prompt": "Reply with exactly this text and nothing else: ATTEMPTED",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly ATTEMPTED",
+        "review_cmd": "echo 'DELIVERABLE MISSING: this review always fails on purpose (machinery test)' && exit 1",
+        "max_fix_rounds": 2,
+        "timeout": 120
+      }
+    ],
+    [
+      {
+        "name": "wave-2-never-runs",
+        "prompt": "This wave must never be dispatched because wave 1 always fails review. If you are reading this, the stop-on-failure rule is broken.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "timeout": 120
+      }
+    ]
+  ]
+}

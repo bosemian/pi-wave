@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="foolflix - a hello-world streaming catalog from the fool-oracle.">
+  <title>foolflix - hello, world</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <h1 class="logo">fool<span>flix</span></h1>
+    <nav aria-label="Primary">
+      <ul class="nav-list">
+        <li><a href="#featured" aria-current="page">Home</a></li>
+        <li><a href="#catalog">Catalog</a></li>
+        <li><a href="#footer">About</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="featured" aria-labelledby="hero-title">
+      <div class="hero-content">
+        <p class="hero-kicker">A hello-world original</p>
+        <h2 id="hero-title">Hello, World</h2>
+        <p class="hero-tagline">
+          The fool-oracle streams its first transmission. Zero seasons,
+          infinite potential, one very enthusiastic greeting.
+        </p>
+        <div class="hero-actions">
+          <button class="btn btn-primary" id="play-btn" type="button">
+            &#9654;&#65038; Play greeting
+          </button>
+          <a class="btn btn-ghost" href="#catalog">Browse catalog</a>
+        </div>
+        <p class="hero-greeting" id="hero-greeting" role="status" aria-live="polite" hidden></p>
+      </div>
+    </section>
+
+    <section class="catalog" id="catalog" aria-labelledby="catalog-title">
+      <h2 id="catalog-title">Trending on foolflix</h2>
+      <p class="catalog-hint">Press <kbd>Enter</kbd> on a card, or click one, to hear what it says.</p>
+      <ul class="card-row" id="card-row"></ul>
+    </section>
+  </main>
+
+  <footer class="site-footer" id="footer">
+    <p>foolflix &mdash; a self-contained hello-world. No build step, no dependencies, no subscription.</p>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

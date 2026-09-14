@@ -1,0 +1,53 @@
+{
+  "name": "role-split",
+  "cwd": ".",
+  "on_failure": "stop",
+  "display": "auto",
+  "orchestrator": {"model": "openai-codex/gpt-5.5", "thinking": "high"},
+  "waves": [
+    [
+      {
+        "name": "research",
+        "prompt": "Create research.py: a standalone stdlib-only module that documents the design of a tiny URL-shortener service. Include a DOCSTRING summary, a SERVICE_DESIGN dict (keys: endpoint, storage, slug_length, with one-line string values), and a function tradeoffs() that returns a list of (option, pro, con) tuples covering at least 3 storage options. No imports from sibling files.",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": ["research.py"],
+        "done_when": "research.py imports cleanly and exposes SERVICE_DESIGN and tradeoffs()",
+        "review_cmd": "python3 -c 'import research; research.tradeoffs()'",
+        "timeout": 300
+      },
+      {
+        "name": "frontend",
+        "prompt": "Create frontend.py: a standalone stdlib-only module of CLI formatting helpers for a tiny URL-shortener service. Implement render_table(rows: list[tuple]) returning an aligned plain-text table, and shorten_output(url: str, slug: str) returning a one-line result string. No imports from sibling files.",
+        "model": "kimi-coding/k3",
+        "thinking": "high",
+        "files": ["frontend.py"],
+        "done_when": "frontend.py imports cleanly and render_table formats a 2-row table with aligned columns",
+        "timeout": 300
+      }
+    ],
+    [
+      {
+        "name": "qa",
+        "prompt": "Create qa.py: a standalone stdlib-only test-support module for a tiny URL-shortener service. Implement check_slug(slug: str) -> tuple[bool, str] validating slug charset and length (3-16 chars, [a-z0-9]), and run_checks(cases: list[tuple]) that runs check_slug over the cases and returns pass/fail counts as a dict. No imports from sibling files.",
+        "model": "openai-codex/gpt-5.5",
+        "thinking": "high",
+        "files": ["qa.py"],
+        "done_when": "qa.py imports cleanly; check_slug accepts 'abc123' and rejects 'XY!' and 'ab'",
+        "review_cmd": "python3 -c 'import qa; assert qa.check_slug(\"abc123\")[0]; assert not qa.check_slug(\"ab\")[0]'",
+        "timeout": 300
+      },
+      {
+        "name": "security",
+        "prompt": "Create security.py: a standalone stdlib-only input-safety module for a tiny URL-shortener service. Implement sanitize_url(url: str) that rejects non-http(s) schemes and strips control characters, raising ValueError on invalid input, and audit(candidates: list[str]) returning a list of booleans for which URLs are safe. No imports from sibling files.",
+        "model": "claude-sonnet-5",
+        "kind": "omp",
+        "thinking": "high",
+        "files": ["security.py"],
+        "done_when": "security.py imports cleanly; sanitize_url accepts 'https://x.dev' and raises ValueError on 'javascript:alert(1)'",
+        "review_cmd": "python3 -c 'import security; security.sanitize_url(\"https://x.dev\"); import sys\ntry: security.sanitize_url(\"javascript:alert(1)\")\nexcept ValueError: pass\nelse: sys.exit(1)'",
+        "timeout": 300
+      }
+    ]
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "research-wigolo-selfcheck",
+  "cwd": ".",
+  "on_failure": "stop",
+  "waves": [
+    [
+      {
+        "name": "wave-1-webresearch",
+        "prompt": "Use your web tools (wigolo MCP: search, fetch, extract) to find the latest published version of the npm package 'wigolo' and its source repository URL. Report the version, the repo URL, and cite at least 2 source URLs you actually fetched. IMPORTANT: if you have no working web/MCP tools, reply with exactly this text and nothing else: WEB-TOOLS-UNAVAILABLE",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "reports version + repo URL with at least 2 cited source URLs (or the literal WEB-TOOLS-UNAVAILABLE signal)",
+        "mcp_config": "~/.config/mcp/wigolo.mcp.json",
+        "timeout": 240
+      }
+    ]
+  ]
+}

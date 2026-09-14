@@ -1,0 +1,19 @@
+{
+  "name": "smoke-1-agent-herdr",
+  "cwd": ".",
+  "display": "herdr",
+  "on_failure": "stop",
+  "waves": [
+    [
+      {
+        "name": "wave-1-smoke",
+        "prompt": "This is a smoke test. Reply with exactly this text and nothing else: PI-WAVE-HERDR-OK",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PI-WAVE-HERDR-OK",
+        "timeout": 120
+      }
+    ]
+  ]
+}

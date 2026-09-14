@@ -1,0 +1,20 @@
+{
+  "name": "smoke-1-agent-omp-herdr",
+  "cwd": ".",
+  "display": "herdr",
+  "on_failure": "stop",
+  "waves": [
+    [
+      {
+        "name": "wave-1-smoke-omp",
+        "prompt": "This is a smoke test. Reply with exactly this text and nothing else: PI-WAVE-OMP-OK",
+        "model": "claude-sonnet-5",
+        "kind": "omp",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PI-WAVE-OMP-OK",
+        "timeout": 120
+      }
+    ]
+  ]
+}
