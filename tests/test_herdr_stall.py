@@ -62,7 +62,8 @@ class FakeHerdrBackend:
         return "w1:pF"
 
     async def start_agent(self, name, pane_id, model, provider, thinking,
-                          mcp_config: str = "", kind: str = "pi"):
+                          mcp_config: str = "", kind: str = "pi",
+                          system_prompt: str = ""):
         return ["fake", "--model", model]
 
     async def prompt(self, name, text, timeout_s: float) -> None:
@@ -306,6 +307,41 @@ class TestOrchestratorRecovery(unittest.TestCase):
         self.assertEqual(recovery["watch_s"], 10.0)
 
 
+class TestPaneLayout(unittest.TestCase):
+    """The grid: orchestrator right, the assignment row splits down off it,
+    then every later pane fills right along that row."""
+
+    def test_orch_right_then_row_splits_down_then_right(self):
+        from pi_wave.herdr_backend import PaneLayout
+
+        calls: list[tuple] = []
+        ids = itertools.count(1)
+
+        class RecBackend:
+            async def split_pane(self, pane_id=None, direction="right", ratio=0.5):
+                calls.append((pane_id, direction, ratio))
+                return f"p{next(ids)}"
+
+        layout = PaneLayout()
+        b = RecBackend()
+
+        async def run():
+            orch = await layout.next_split(b, ratio=0.4)  # orchestrator
+            a1 = await layout.next_split(b)               # first assignment
+            a2 = await layout.next_split(b)               # second assignment
+            a3 = await layout.next_split(b)               # third assignment
+            return orch, a1, a2, a3
+
+        orch, a1, a2, a3 = asyncio.run(run())
+        # orchestrator: engine's own pane, to the right, wider ratio
+        self.assertEqual(calls[0], (None, "right", 0.4))
+        # first assignment drops down off the orchestrator to open the row
+        self.assertEqual(calls[1], (orch, "down", 0.5))
+        # every later assignment fills right along that same row
+        self.assertEqual(calls[2], (a1, "right", 0.5))
+        self.assertEqual(calls[3], (a2, "right", 0.5))
+
+
 def make_wave_plan(tmp: str, n: int, display: str):
     proj = Path(tmp) / "proj"
     proj.mkdir(exist_ok=True)
@@ -324,7 +360,7 @@ def make_wave_plan(tmp: str, n: int, display: str):
     return load_plan(f)
 
 
-async def _fake_run_assignment(a, wave_idx, plan, results, emit, orch=None):
+async def _fake_run_assignment(a, wave_idx, plan, results, emit, orch=None, layout=None):
     from pi_wave.orchestrator import AgentResult
     return AgentResult(name=a.name, wave=wave_idx + 1, model=a.model,
                        status="pass", rounds=1)
@@ -340,8 +376,8 @@ class TestWaveGuard(unittest.TestCase):
         asyncio.run(orchestrate(plan, events.append))
         return events
 
-    def test_three_herdr_agents_stops_before_dispatch(self):
-        plan = make_wave_plan(self.tmp, 3, display="herdr")
+    def test_five_herdr_agents_stops_before_dispatch(self):
+        plan = make_wave_plan(self.tmp, 5, display="herdr")
         with mock.patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=False), \
              mock.patch.object(orchestrator, "run_assignment",
                                _fake_run_assignment):
@@ -350,12 +386,12 @@ class TestWaveGuard(unittest.TestCase):
         types = [e["type"] for e in events]
         self.assertNotIn("wave_start", types)
         stopped = [e for e in events if e["type"] == "stopped"][0]
-        self.assertIn("2 agents per wave", stopped["reason"])
+        self.assertIn("4 agents per wave", stopped["reason"])
         summary = [e for e in events if e["type"] == "summary"][0]
         self.assertEqual(summary["status"], "stopped")
 
-    def test_two_herdr_agents_dispatch(self):
-        plan = make_wave_plan(self.tmp, 2, display="herdr")
+    def test_four_herdr_agents_dispatch(self):
+        plan = make_wave_plan(self.tmp, 4, display="herdr")
         with mock.patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=False), \
              mock.patch.object(orchestrator, "run_assignment",
                                _fake_run_assignment):

@@ -28,13 +28,13 @@ update and returns the `summary` object as the tool result.
 ## Quick start
 
 ```bash
-# validate a plan without spending tokens (run from the repo root —
-# repo-owned plans use "cwd": "." so they work from any checkout location)
-cd ~/labs/pi-wave
-python3 run.py examples/example-plan.json --dry-run
+# validate a plan without spending tokens — works from any directory.
+# A plan with no "cwd" (or "cwd": ".") anchors agents to the directory
+# you launch from — not the pi-wave repo.
+python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/examples/example-plan.json --dry-run
 
 # run it (spawns real pi agents — costs API tokens)
-python3 run.py examples/example-plan.json
+python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/examples/example-plan.json
 
 # run the same plan on a different model/thinking without editing it
 python3 run.py examples/example-plan.json --model anthropic/claude-x --thinking low
@@ -47,9 +47,11 @@ The example plan runs two read-only `gpt-5.6-luna` agents in wave 1 and one
 
 `examples/role-split-plan.json` shows role-splitting with a model per role:
 research / frontend run in wave 1, qa / security in wave 2 — two agents per
-wave, the delegate-wave pane cap (see enforced rules below). Each role owns
-its own file with its own `model` + `thinking`; the security role
-demonstrates `kind: "omp"` (bare Sonnet id via the OMP CLI). Inspect it with
+wave, within the delegate-wave pane cap (see enforced rules below). The
+code-writing frontend role runs `kimi-coding/k3` (code changes are k3-only,
+never a gpt-5 model), research runs cheap `openai-codex/gpt-5.6-luna`, and
+the qa / security roles demonstrate `kind: "omp"` (bare Sonnet id via the
+OMP CLI). Inspect it with
 `--dry-run`; running it creates the four modules in the plan's `cwd`
 (review_cmd checks each one imports cleanly).
 
@@ -64,7 +66,9 @@ installed can delegate waves correctly. No skill has to be loaded or edited:
   the OMP CLI; everything else is `kind: "pi"` (provider-qualified id).
 - Plan-level `"orchestrator": true` (or `{model, thinking}`) spawns the skill's
   orchestrator pane first — wider pane (`ratio 0.4`), default
-  `openai-codex/gpt-5.6-sol` at `high`. It reviews agents that have no
+  `openai-codex/gpt-5.5` at `high`, pinned with a role system prompt so it
+  only reviews and synthesizes — it never implements assignments itself.
+  It reviews agents that have no
   `review_cmd` against their `done_when` (strict `VERDICT: pass|fail` reply)
   and writes the final `synthesis` in the summary. `review_cmd` still wins
   when present; the name `orchestrator` is reserved.
@@ -117,6 +121,23 @@ bot to read the dashboard, and driving waves from a pi agent — live in
 Chat apps like Cursor's Bot expose no API to inject messages, so push mode
 drives the app itself: each push activates it, pastes a one-line digest
 from the clipboard, and presses Enter (AppleScript via `osascript`).
+
+Per-role digests can land in one chat per role. When a role finishes
+(`agent_done`) its push carries a two-line summary — the pass/fail status
+plus the role's own last line (agents are prompted to end with a concise
+summary of what they did); a failed review goes to the same place. Where it
+lands depends on `PI_WAVE_CHAT_ROLE_URL`:
+
+- **set** (e.g. `grok://chat/{role}`) — the push `open`s that per-chat URL to
+  focus the role's own chat inside a single app, then pastes. One role, one
+  chat. `{role}` is the role name.
+- **unset** (default) — the push falls back to a separate app named after the
+  role via `PI_WAVE_CHAT_ROLE_APP` (default the bare role name, e.g.
+  `research`, `frontend`).
+
+Run-level digests (`plan_start`, `wave_done`, the final `summary`) always go
+to `PI_WAVE_CHAT_APP`.
+
 Opt-in because the trade-offs are real:
 
 - **focus steal** — every push activates the chat app (~1s); fine for
@@ -137,7 +158,9 @@ PI_WAVE_CHAT_PUSH=on python3 run.py examples/role-split-plan.json
 | Env | Default | Notes |
 |---|---|---|
 | `PI_WAVE_CHAT_PUSH` | `off` | `on` enables the sink |
-| `PI_WAVE_CHAT_APP` | `Grok Bot` | app name as AppleScript sees it |
+| `PI_WAVE_CHAT_APP` | `Grok Bot` | app for run-level digests (plan/wave/summary), as AppleScript sees it |
+| `PI_WAVE_CHAT_ROLE_URL` | *(unset)* | per-chat URL for per-role digests; when set (e.g. `grok://chat/{role}`) each role's push opens its own chat. Overrides `PI_WAVE_CHAT_ROLE_APP` |
+| `PI_WAVE_CHAT_ROLE_APP` | `{role}` | fallback when `PI_WAVE_CHAT_ROLE_URL` is unset: app for per-role digests; `{role}` is the role name (e.g. `Grok · {role}`) |
 | `PI_WAVE_CHAT_EVENTS` | `plan_start,review_failed,agent_done,wave_done,summary` | comma list; the summary arrives as a multi-line digest |
 | `PI_WAVE_CHAT_SEND_KEY` | `return` | use `cmd+return` if Enter only adds a newline in the composer |
 | `PI_WAVE_CHAT_DELAY` | `0.8` | seconds to wait after activate before pasting; raise if the app opens slowly |
@@ -243,11 +266,12 @@ every single OMP stall. Fixed by skipping the resend for `kind: "omp"`
 
 - **Same-wave file conflict rejected at load time** — two agents in one wave may
   never touch the same file; the loader fails fast and names the culprits.
-- **Max 2 herdr-display agents per wave** (checked at dispatch) — the skill's
-  pane cap: every assignment pane splits the caller's pane in the same
-  direction, so a third and fourth pane become unusably narrow (observed: the
-  last-split agent stalls or fails to start). Split the work into more waves
-  or force `display: "headless"`, which has no panes and no cap.
+- **Max 4 herdr-display agents per wave** (checked at dispatch) — the
+  orchestrator splits right, the assignment row splits down off it and then
+  fills to the right, so too many panes in one wave still become unusably
+  narrow (observed: the last-split agent stalls or fails to start). Split the
+  work into more waves or force `display: "headless"`, which has no panes and
+  no cap.
 - **Model verified at start** — after spawning, the engine checks `get_state`
   against the requested model and aborts the assignment on mismatch (the RPC
   analogue of delegate-wave's "check the pane footer" rule).

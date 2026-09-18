@@ -168,7 +168,7 @@ class TestKindAndOrchestrator(unittest.TestCase):
             "orchestrator": True,
             "waves": [[base_assignment()]],
         }))
-        self.assertEqual(p.orchestrator.model, "openai-codex/gpt-5.6-sol")
+        self.assertEqual(p.orchestrator.model, "openai-codex/gpt-5.5")
         self.assertEqual(p.orchestrator.thinking, "high")
 
     def test_orchestrator_object_custom(self):
@@ -317,10 +317,10 @@ class TestOverrides(unittest.TestCase):
 
 class TestRepoExamples(unittest.TestCase):
     def test_role_split_respects_pane_cap(self):
-        # delegate-wave skill: at most 2 herdr-display agents per wave
+        # delegate-wave skill: at most 4 herdr-display agents per wave
         root = Path(__file__).resolve().parents[1]
         p = load_plan(root / "examples" / "role-split-plan.json")
-        self.assertTrue(all(len(w) <= 2 for w in p.waves),
+        self.assertTrue(all(len(w) <= 4 for w in p.waves),
                         f"wave sizes: {[len(w) for w in p.waves]}")
 
 

@@ -37,7 +37,7 @@ export default function (pi: ExtensionAPI) {
       "independent chunks that can run in parallel; prefer it over doing the work " +
       "yourself or typing herdr commands. " +
       "YOU build the plan (inline object or a JSON file path). Schema: " +
-      '{ name, cwd: "/abs/project/dir", on_failure: "stop"|"continue", display: "auto"(herdr panes inside Herdr, headless otherwise)|"herdr"|"headless", orchestrator: true|{model,thinking,synthesis_model,synthesis_thinking} (spawns a wider orchestrator pane, default openai-codex/gpt-5.6-sol at high, which reviews agents that have no review_cmd against their done_when and writes the final synthesis; set synthesis_model/synthesis_thinking to hand ONLY the synthesis to a dedicated synthesizer pane), waves: [[assignment, ...], ...] }. ' +
+      '{ name, cwd: "/abs/project/dir" (omitted or "." = the directory this session runs in — agents work there), on_failure: "stop"|"continue", display: "auto"(herdr panes inside Herdr, headless otherwise)|"herdr"|"headless", orchestrator: true|{model,thinking,synthesis_model,synthesis_thinking} (spawns a wider orchestrator pane, default openai-codex/gpt-5.5 at high, which reviews agents that have no review_cmd against their done_when and writes the final synthesis; set synthesis_model/synthesis_thinking to hand ONLY the synthesis to a dedicated synthesizer pane), waves: [[assignment, ...], ...] }. ' +
       "Each wave runs its assignments in parallel; later waves only start after the " +
       "previous one passes. Assignment fields: name (unique plan-wide, ^[a-z][a-z0-9_-]{0,31}$, " +
       "never \"orchestrator\"), prompt (SELF-CONTAINED — the subagent cannot ask questions; " +
@@ -48,9 +48,10 @@ export default function (pi: ExtensionAPI) {
       "review_cmd (optional shell command, exit 0 = pass — takes precedence over the " +
       "orchestrator review), timeout (seconds per prompt round), needs_results (names of " +
       "earlier-wave agents whose final texts are injected into this prompt). " +
-      "Model guidance: reasoning/design/plan → openai-codex/gpt-5.6-sol high; code changes → " +
-      "kimi-coding/k3 high; quality/review/test → claude-sonnet-5 high via kind omp; cheap " +
-      "breadth (discovery, grepping, summarising) → openai-codex/gpt-5.6-luna off. " +
+      "Model guidance: reasoning/design/plan → openai-codex/gpt-5.5 high; code changes → " +
+      "kimi-coding/k3 high ONLY — any assignment that writes or edits files must run k3, " +
+      "never a gpt-5 model; quality/review/test → claude-sonnet-5 high via kind omp; cheap " +
+      "read-only breadth (discovery, grepping, summarising) → openai-codex/gpt-5.6-luna off. " +
       "Rules the engine enforces: two assignments in the same wave never touch the same " +
       "file; model/effort are verified at spawn (mismatch fails fast); a blocked agent is " +
       "surfaced, never auto-answered; panes stay open for the user. " +
@@ -58,11 +59,11 @@ export default function (pi: ExtensionAPI) {
       "yourself. Never call this tool from inside a wave assignment.",
     parameters: Type.Object({
       plan: Type.Union([
-        Type.String({ description: "Absolute path to a wave plan JSON file" }),
+        Type.String({ description: "Path to a wave plan JSON file (relative paths resolve against the current working directory)" }),
         Type.Record(Type.String(), Type.Unknown(), {
           description: "The wave plan object inline (written to a temp file)",
         }),
-      ], { description: "Wave plan: the plan object inline (preferred) or an absolute path to the JSON file" }),
+      ], { description: "Wave plan: the plan object inline (preferred) or a path to the JSON file" }),
       model: Type.Optional(Type.String({
         description:
           "Override every assignment's model without editing the plan " +
@@ -77,17 +78,20 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_toolCallId, params, signal, onUpdate) {
+      const callerCwd = process.cwd();
       let planPath = params.plan;
       if (typeof planPath !== "string") {
         planPath = path.join(os.tmpdir(), `pi-wave-plan-${Date.now()}.json`);
         writeFileSync(planPath, JSON.stringify(params.plan, null, 2));
+      } else if (!path.isAbsolute(planPath)) {
+        planPath = path.join(callerCwd, planPath);
       }
       const runnerArgs = [RUNNER, planPath];
       if (params.model) runnerArgs.push("--model", params.model);
       if (params.provider) runnerArgs.push("--provider", params.provider);
       if (params.thinking) runnerArgs.push("--thinking", params.thinking);
       const child = spawn(PYTHON, runnerArgs, {
-        cwd: HOME,
+        cwd: callerCwd,
         signal,
         env: process.env,
       });

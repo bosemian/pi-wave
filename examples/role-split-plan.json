@@ -30,7 +30,8 @@
       {
         "name": "qa",
         "prompt": "Create qa.py: a standalone stdlib-only test-support module for a tiny URL-shortener service. Implement check_slug(slug: str) -> tuple[bool, str] validating slug charset and length (3-16 chars, [a-z0-9]), and run_checks(cases: list[tuple]) that runs check_slug over the cases and returns pass/fail counts as a dict. No imports from sibling files.",
-        "model": "openai-codex/gpt-5.5",
+        "model": "claude-sonnet-5",
+        "kind": "omp",
         "thinking": "high",
         "files": ["qa.py"],
         "done_when": "qa.py imports cleanly; check_slug accepts 'abc123' and rejects 'XY!' and 'ab'",

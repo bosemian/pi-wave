@@ -21,6 +21,7 @@ from .herdr_backend import (
     HerdrBackend,
     HerdrBlocked,
     HerdrPromptStalled,
+    PaneLayout,
     herdr_available,
 )
 
@@ -52,6 +53,8 @@ REVIEW FEEDBACK:
 
 ORCH_REVIEW_TEMPLATE = """\
 You are the wave orchestrator reviewing assignment agent "{name}".
+Review only — never edit files or do the assignment's work yourself; your \
+entire reply must be the VERDICT block.
 
 DEFINITION OF DONE: {done_when}
 ORIGINAL ASSIGNMENT:
@@ -68,35 +71,59 @@ If fail, lines 2+ are ONE consolidated list of everything the agent must fix."""
 
 ORCH_SYNTH_TEMPLATE = """\
 All waves are done. Synthesize ONE final summary for the user: what changed, \
-what was verified, and what remains. Do not repeat each agent's report verbatim.
+what was verified, and what remains. Do not repeat each agent's report \
+verbatim. Text only — do not modify any files.
 
 PER-AGENT OUTCOMES:
 {outcomes}"""
 
+# Role constraints pinned into the panes' system prompts (via
+# --append-system-prompt, see HerdrBackend.start_agent): the orchestrator
+# only reviews and synthesizes — it never implements assignments itself.
+# The soft version of this rule also lives in the templates above; a hard
+# guard (like assignment agents' --no-extensions) is not possible here
+# because the pane needs its tools to read the repo while reviewing.
+ORCH_ROLE_SYSTEM_PROMPT = """\
+You are the delegate-wave orchestrator pane. The engine dispatches every \
+assignment to other panes — your pane never implements anything. NEVER edit, \
+create, or run code to do an assignment's work yourself. When asked to \
+review, reply with ONLY the VERDICT block the prompt specifies; when asked \
+to synthesize, reply with the summary text only."""
+
+SYNTH_ROLE_SYSTEM_PROMPT = """\
+You are the synthesizer pane of a delegated wave run. Your only job is \
+writing the final summary text when asked. Never edit, create, or run code; \
+never implement assignments."""
+
 MAX_INJECTED_RESULT_CHARS = 6000
 ORCH_INTERACT_TIMEOUT = 300.0
-MAX_HERDR_AGENTS_PER_WAVE = 2
+MAX_HERDR_AGENTS_PER_WAVE = 4
 
 
 class OrchestratorPane:
-    """The delegate-wave orchestrator agent (wider pane, sol @ high by default).
+    """The delegate-wave orchestrator agent (wider pane, gpt-5.5 @ high by
+    default).
 
     One pane serves the whole run, so every interaction takes the lock —
     concurrent assignment coroutines must never interleave prompts."""
 
-    def __init__(self, backend: HerdrBackend, spec: OrchestratorSpec) -> None:
+    def __init__(self, backend: HerdrBackend, spec: OrchestratorSpec,
+                 layout: PaneLayout) -> None:
         self._backend = backend
         self._spec = spec
+        self._layout = layout
         self._lock = asyncio.Lock()
         self.pane = ""
         self.synth_pane = ""
 
     async def start(self) -> None:
-        # split first with a lower ratio so the orchestrator pane ends up
-        # wider than any assignment pane (skill: 0.4, before any wave pane)
-        self.pane = await self._backend.split_pane(ratio=0.4)
+        # first split of the run (PaneLayout): the engine's own pane, to the
+        # right, with a lower ratio so the orchestrator ends up wider than any
+        # assignment pane (skill: 0.4, before any wave pane)
+        self.pane = await self._layout.next_split(self._backend, ratio=0.4)
         await self._backend.start_agent(
-            "orchestrator", self.pane, self._spec.model, None, self._spec.thinking)
+            "orchestrator", self.pane, self._spec.model, None, self._spec.thinking,
+            system_prompt=ORCH_ROLE_SYSTEM_PROMPT)
 
     async def review(self, a: Assignment, text: str) -> tuple[bool, str]:
         """Judge one agent result against its done_when → (ok, feedback)."""
@@ -127,11 +154,12 @@ class OrchestratorPane:
                 # synthesis is reasoning work — a dedicated one-shot
                 # `synthesizer` pane (split lazily, reused, left open)
                 if not self.synth_pane:
-                    self.synth_pane = await self._backend.split_pane()
+                    self.synth_pane = await self._layout.next_split(self._backend)
                     await self._backend.start_agent(
                         "synthesizer", self.synth_pane,
                         self._spec.synthesis_model, None,
-                        self._spec.synthesis_thinking or "high")
+                        self._spec.synthesis_thinking or "high",
+                        system_prompt=SYNTH_ROLE_SYSTEM_PROMPT)
                 await self._backend.prompt(
                     "synthesizer", prompt, timeout_s=ORCH_INTERACT_TIMEOUT)
                 return await self._backend.read("synthesizer")
@@ -290,9 +318,10 @@ async def run_assignment(
     results: dict[str, AgentResult],
     emit: Emitter,
     orch: OrchestratorPane | None = None,
+    layout: PaneLayout | None = None,
 ) -> AgentResult:
     if resolve_display(a.display) == "herdr":
-        return await _run_assignment_herdr(a, wave_idx, plan, results, emit, orch)
+        return await _run_assignment_herdr(a, wave_idx, plan, results, emit, orch, layout)
     return await _run_assignment_rpc(a, wave_idx, plan, results, emit)
 
 
@@ -303,6 +332,7 @@ async def _run_assignment_herdr(
     results: dict[str, AgentResult],
     emit: Emitter,
     orch: OrchestratorPane | None = None,
+    layout: PaneLayout | None = None,
 ) -> AgentResult:
     """Agent lives in a Herdr pane (delegate-wave visual): split, start, prompt,
     read scrollback. Panes are left open for the user to inspect."""
@@ -318,7 +348,10 @@ async def _run_assignment_herdr(
     emit({"type": "agent_start", "agent": a.name, "wave": res.wave,
           "model": a.model, "display": "herdr", "kind": a.kind})
     try:
-        pane = await backend.split_pane()
+        if layout is not None:
+            pane = await layout.next_split(backend)
+        else:
+            pane = await backend.split_pane()
         res.pane = pane
         await backend.start_agent(a.name, pane, a.model, a.provider, a.thinking,
                                   mcp_config=a.mcp_config, kind=a.kind)
@@ -375,7 +408,7 @@ async def _run_assignment_herdr(
         res.error = str(e)
     # Intentionally no teardown: the pane and the agent stay open for the user.
     emit({"type": "agent_done", "agent": a.name, "status": res.status,
-          "rounds": res.rounds, "pane": res.pane})
+          "rounds": res.rounds, "pane": res.pane, "text": res.text})
     return res
 
 
@@ -454,7 +487,8 @@ async def _run_assignment_rpc(
         res.error = str(e)
     finally:
         await sess.close()
-    emit({"type": "agent_done", "agent": a.name, "status": res.status, "rounds": res.rounds})
+    emit({"type": "agent_done", "agent": a.name, "status": res.status,
+          "rounds": res.rounds, "text": res.text})
     return res
 
 
@@ -467,13 +501,16 @@ async def orchestrate(plan: Plan, emit: Emitter) -> dict[str, Any]:
         "agents": sum(len(w) for w in plan.waves),
     })
 
+    # one shared grid for the whole run: orchestrator right, then the
+    # assignment row splits down and fills right (see PaneLayout)
+    layout = PaneLayout()
     orch: OrchestratorPane | None = None
     if plan.orchestrator:
         problem = herdr_available()
         if problem:
             emit({"type": "orchestrator_error", "error": problem})
         else:
-            orch = OrchestratorPane(HerdrBackend(cwd=plan.cwd), plan.orchestrator)
+            orch = OrchestratorPane(HerdrBackend(cwd=plan.cwd), plan.orchestrator, layout)
             try:
                 await orch.start()
                 emit({"type": "orchestrator_start",
@@ -487,10 +524,11 @@ async def orchestrate(plan: Plan, emit: Emitter) -> dict[str, Any]:
     results: dict[str, AgentResult] = {}
     overall = "completed"
     for w_idx, wave in enumerate(plan.waves):
-        # delegate-wave skill: 2 agents per wave in herdr mode — more
-        # same-direction splits off the caller's pane make unusably narrow
-        # columns (observed: the last-split agent stalls/fails). Headless
-        # waves have no panes and no such limit.
+        # delegate-wave skill: 4 agents per wave in herdr mode — the
+        # assignment row fills right (see PaneLayout), so too many panes in
+        # one wave still make unusably narrow columns (observed: the
+        # last-split agent stalls/fails). Headless waves have no panes and
+        # no such limit.
         herdr_agents = [a.name for a in wave if resolve_display(a.display) == "herdr"]
         if len(herdr_agents) > MAX_HERDR_AGENTS_PER_WAVE:
             overall = "stopped"
@@ -506,7 +544,7 @@ async def orchestrate(plan: Plan, emit: Emitter) -> dict[str, Any]:
             break
         emit({"type": "wave_start", "wave": w_idx + 1, "agents": [a.name for a in wave]})
         outcomes = await asyncio.gather(
-            *(run_assignment(a, w_idx, plan, results, emit, orch) for a in wave)
+            *(run_assignment(a, w_idx, plan, results, emit, orch, layout) for a in wave)
         )
         for r in outcomes:
             results[r.name] = r

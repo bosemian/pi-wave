@@ -1,9 +1,11 @@
 """Herdr display backend — assignment agents run live in Herdr panes.
 
 Used when an assignment has display: "herdr". The engine must itself run
-inside a Herdr pane (HERDR_ENV=1): it inherits the caller context, so
-`pane split --current` splits the parent agent's pane and every wave agent
-stays visible next to it — the delegate-wave visual, driven by a program.
+inside a Herdr pane (HERDR_ENV=1): it inherits the caller context, so the
+first `pane split --current` splits the parent agent's pane to the right
+(the orchestrator), the next pane splits down off it to open the assignment
+row, and every pane after that splits right along that row (see PaneLayout)
+— the delegate-wave visual, driven by a program.
 
 Rules carried over from the herdr/delegate-wave skills:
 - equal assignment panes: split --ratio 0.5 each time;
@@ -47,6 +49,43 @@ def herdr_available() -> str | None:
     if not shutil.which("herdr"):
         return "herdr binary not found in PATH"
     return None
+
+
+class PaneLayout:
+    """Shared pane-grid tracker for one delegate-wave run.
+
+    The first pane splits the engine's own pane to the right (the
+    orchestrator), the second splits down off it to open the assignment
+    row, and every pane after that splits right along that row:
+
+        +---+--------------------+
+        | E |         O          |
+        |   +----+----+----+-----+
+        |   | a1 | a2 | a3 | a4  |
+        +---+----+----+----+-----+
+
+    Each split targets the previously created pane, so the row grows to the
+    right. Splits are serialized under a lock so the chain stays
+    deterministic even when a wave dispatches its agents concurrently."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._last_pane: str | None = None
+        self._count = 0
+
+    async def next_split(self, backend: "HerdrBackend", ratio: float = 0.5) -> str:
+        async with self._lock:
+            if self._count == 0:
+                # first split of the run: the engine's own pane, to the right
+                pane = await backend.split_pane(direction="right", ratio=ratio)
+            else:
+                # second pane drops down to start the row; the rest fill right
+                direction = "down" if self._count == 1 else "right"
+                pane = await backend.split_pane(
+                    pane_id=self._last_pane, direction=direction, ratio=ratio)
+            self._count += 1
+            self._last_pane = pane
+            return pane
 
 
 def _find_key(obj: Any, key: str) -> Any:
@@ -121,29 +160,37 @@ class HerdrBackend:
 
     # -- wave-agent lifecycle -------------------------------------------------
 
-    async def split_pane(self, ratio: float = 0.5) -> str:
-        """Split the calling pane to the right and return the new pane id.
+    async def split_pane(self, pane_id: str | None = None,
+                         direction: str = "right", ratio: float = 0.5) -> str:
+        """Split a pane and return the new pane id.
 
-        Assignment panes keep the delegate-wave default of equal halves
-        (0.5); the orchestrator pane is split first with a lower ratio so it
-        ends up wider than any assignment pane."""
+        With no pane_id, splits the engine's own current pane (the first
+        split of a run); otherwise splits the given pane. direction is
+        "right" or "down". Assignment panes keep the delegate-wave default
+        of equal halves (0.5); the orchestrator pane is split first with a
+        lower ratio so it ends up wider than any assignment pane. The grid
+        policy lives in PaneLayout."""
+        target = ["--current"] if pane_id is None else ["--pane", pane_id]
         resp = await self._run_json([
-            "pane", "split", "--current", "--direction", "right",
+            "pane", "split", *target, "--direction", direction,
             "--cwd", self._cwd, "--no-focus", "--ratio", str(ratio),
         ])
-        pane_id = _find_key(resp.get("result", resp), "pane_id")
-        if not pane_id:
+        new_pane = _find_key(resp.get("result", resp), "pane_id")
+        if not new_pane:
             raise HerdrError(f"pane split returned no pane_id: {json.dumps(resp)[:300]}")
-        return str(pane_id)
+        return str(new_pane)
 
     async def start_agent(self, name: str, pane_id: str, model: str,
                           provider: str | None, thinking: str,
-                          mcp_config: str = "", kind: str = "pi") -> list[str]:
+                          mcp_config: str = "", kind: str = "pi",
+                          system_prompt: str = "") -> list[str]:
         """Start an agent in the pane; returns the argv Herdr detected.
 
         kind "pi" runs the pi agent CLI (model must be provider-qualified);
         kind "omp" runs the OMP CLI with a bare model id (the delegate-wave
-        rule: only Sonnet goes through OMP)."""
+        rule: only Sonnet goes through OMP). system_prompt, when set, is
+        appended to the pi agent's system prompt — role constraints that
+        must hold before any prompt arrives (pi kind only)."""
         if kind == "omp":
             model_arg = model.split("/")[-1]
         else:
@@ -153,6 +200,8 @@ class HerdrBackend:
             # interactive pi already loads pi-mcp-adapter (user package);
             # only hand it this assignment's config
             extra += ["--mcp-config", str(Path(mcp_config).expanduser())]
+        if system_prompt and kind == "pi":
+            extra += ["--append-system-prompt", system_prompt]
         resp = await self._run_json(
             ["agent", "start", name, "--kind", kind, "--pane", pane_id,
              "--timeout", "60000", "--", *extra],

@@ -39,7 +39,7 @@ Plan-level:
   "orchestrator": true,   // or {"model": "...", "thinking": "high",
 }                         //     "synthesis_model": "...", "synthesis_thinking": "high"}
                           // spawns the delegate-wave orchestrator pane (default
-                          // openai-codex/gpt-5.6-sol at high, wider pane). It
+                          // openai-codex/gpt-5.5 at high, wider pane). It
                           // reviews results without a review_cmd and writes the
                           // final synthesis. Set synthesis_model/synthesis_thinking
                           // to hand ONLY the synthesis to a dedicated
@@ -98,11 +98,11 @@ class Assignment:
 @dataclass
 class OrchestratorSpec:
     """The delegate-wave orchestrator pane: reviews results against done_when
-    and writes the final synthesis. Defaults follow the skill (sol @ high).
+    and writes the final synthesis. Defaults follow the skill (gpt-5.5 @ high).
     synthesis_model/synthesis_thinking, when set, hand ONLY the final
     synthesis to a dedicated one-shot `synthesizer` pane; the orchestrator
     pane keeps doing the reviews."""
-    model: str = "openai-codex/gpt-5.6-sol"
+    model: str = "openai-codex/gpt-5.5"
     thinking: str = "high"
     synthesis_model: str = ""
     synthesis_thinking: str = ""
