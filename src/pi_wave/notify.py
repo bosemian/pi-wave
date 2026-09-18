@@ -17,6 +17,12 @@ PI_WAVE_NOTIFY=off disables notifications (default on under darwin).
 An optional third sink (opt-in, PI_WAVE_CHAT_PUSH=on) pushes one-line
 digests into a chat app such as Cursor's Bot by activating it and pasting
 via the clipboard — the only external input channel those apps expose.
+Per-role digests (a role finishing, a failed review) can land in one chat
+per role: set PI_WAVE_CHAT_ROLE_URL to the app's per-chat URL scheme with a
+{role} placeholder (e.g. grok://chat/{role}) and each push opens that URL to
+focus the role's chat before pasting. When it is unset, per-role digests
+fall back to a bot named after the role (PI_WAVE_CHAT_ROLE_APP, default the
+bare role name). Run-level digests go to PI_WAVE_CHAT_APP.
 """
 
 from __future__ import annotations
@@ -109,6 +115,10 @@ class ChatPusher:
     """Pushes short status lines into a chat app (e.g. Cursor's Bot) by
     activating it and pasting via the clipboard — such apps expose no API,
     deep link, or CLI, so UI automation is the only external input channel.
+    `push(text, app=...)` targets a specific app so per-role digests can go
+    to a bot named after the role; run-level digests use the default app.
+    `push(text, url=...)` instead opens a per-chat URL (via `open`) to focus
+    one chat per role before pasting — one role, one chat.
 
     Trade-offs (why this is opt-in): every push steals focus while the
     script activates the app, briefly replaces the clipboard (restored
@@ -130,15 +140,24 @@ class ChatPusher:
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
 
-    def push(self, text: str) -> None:
-        self._q.put(text)
+    def push(self, text: str, app: str | None = None,
+             url: str | None = None) -> None:
+        self._q.put((text, app, url))
 
-    def _script(self, text: str) -> str:
+    def _script(self, text: str, app: str | None = None,
+                url: str | None = None) -> str:
+        app = app or self._app
         # AppleScript string literals cannot hold raw newlines — join parts
         literal = " & return & ".join(
             f'"{_applescript(part)}"' for part in text.split("\n"))
         send = ("keystroke return with command down"
                 if self._send_key == "cmd+return" else "keystroke return")
+        # a per-chat URL focuses one chat (open picks the scheme's handler
+        # app); otherwise activate the app by name. `quoted form of` shell-
+        # quotes the URL so the role name cannot break out of the command.
+        focus = (f"    do shell script \"open \" & quoted form of "
+                 f"\"{_applescript(url)}\"\n" if url else
+                 f"    tell application \"{_applescript(app)}\" to activate\n")
         return (
             "on run\n"
             "    set saved to missing value\n"
@@ -146,7 +165,7 @@ class ChatPusher:
             "        set saved to the clipboard\n"
             "    end try\n"
             f"    set the clipboard to {literal}\n"
-            f"    tell application \"{_applescript(self._app)}\" to activate\n"
+            f"{focus}"
             f"    delay {self._delay}\n"
             "    tell application \"System Events\"\n"
             "        keystroke \"v\" using command down\n"
@@ -163,9 +182,10 @@ class ChatPusher:
             item = self._q.get()
             if item is None:
                 return
+            text, app, url = item
             try:
                 r = subprocess.run(
-                    ["osascript", "-e", self._script(item)],
+                    ["osascript", "-e", self._script(text, app, url)],
                     capture_output=True, timeout=30)
                 if r.returncode != 0 and self._failed < 3:
                     self._failed += 1
@@ -187,12 +207,27 @@ def _md_cell(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ")
 
 
+SUMMARY_CHARS = 280
+
+
+def _tail_summary(text: str) -> str:
+    """The agent is prompted to end its final message with a concise summary
+    of what it did, so the work digest is the LAST non-empty line, capped."""
+    for line in reversed(text.splitlines()):
+        line = line.strip().lstrip("#->*• ").strip()
+        if line:
+            return line[:SUMMARY_CHARS]
+    return ""
+
+
 class Notifier:
     """Observes engine events and maintains the two side channels."""
 
     def __init__(self, plan: Plan, run_dir: Path, mac: MacNotifier | None,
                  chat: ChatPusher | None = None,
-                 chat_events: set[str] | None = None) -> None:
+                 chat_events: set[str] | None = None,
+                 role_app_tmpl: str = "{role}",
+                 role_url_tmpl: str = "") -> None:
         self._plan = plan
         self._run_dir = run_dir
         self.dashboard_path = run_dir / "dashboard.md"
@@ -201,6 +236,8 @@ class Notifier:
         self._chat = chat
         self._chat_events = chat_events if chat_events is not None \
             else set(DEFAULT_CHAT_EVENTS)
+        self._role_app_tmpl = role_app_tmpl
+        self._role_url_tmpl = role_url_tmpl
         self._roles: dict[str, _RoleRow] = {}
         self._orch: _RoleRow | None = None
         self._log: list[str] = []
@@ -243,8 +280,11 @@ class Notifier:
             raw = os.environ.get("PI_WAVE_CHAT_EVENTS", "")
             chat_events = ({e.strip() for e in raw.split(",") if e.strip()}
                            if raw else set(DEFAULT_CHAT_EVENTS))
+        role_app_tmpl = os.environ.get("PI_WAVE_CHAT_ROLE_APP", "{role}")
+        role_url_tmpl = os.environ.get("PI_WAVE_CHAT_ROLE_URL", "")
         return cls(plan, run_dir, MacNotifier() if use_mac else None,
-                   chat=chat, chat_events=chat_events)
+                   chat=chat, chat_events=chat_events,
+                   role_app_tmpl=role_app_tmpl, role_url_tmpl=role_url_tmpl)
 
     # -- event intake ---------------------------------------------------
 
@@ -284,6 +324,30 @@ class Notifier:
     def _push(self, etype: str, text: str) -> None:
         if self._chat is not None and etype in self._chat_events:
             self._chat.push(text)
+
+    def _role_app(self, role: str) -> str:
+        try:
+            return self._role_app_tmpl.format(role=role)
+        except (KeyError, IndexError):
+            return role
+
+    def _role_url(self, role: str) -> str | None:
+        if not self._role_url_tmpl:
+            return None
+        try:
+            return self._role_url_tmpl.format(role=role)
+        except (KeyError, IndexError):
+            return None
+
+    def _push_role(self, etype: str, role: str, text: str) -> None:
+        """Push a per-role digest to the role's own chat: open its per-chat
+        URL when PI_WAVE_CHAT_ROLE_URL is set, else the bot named per role."""
+        if self._chat is not None and etype in self._chat_events:
+            url = self._role_url(role)
+            if url is not None:
+                self._chat.push(text, url=url)
+            else:
+                self._chat.push(text, app=self._role_app(role))
 
     def _record(self, event: dict) -> None:
         with self._events_path.open("a", encoding="utf-8") as f:
@@ -328,8 +392,8 @@ class Notifier:
                                       + _md_cell(tail[-DETAIL_CHARS:]))
             self._log.append(f"{name} review failed (round {event.get('round')})")
             self._notify(name, f"🔁 failed review · round {event.get('round')}")
-            self._push("review_failed",
-                       f"🔁 {name} failed review — fix round {event.get('round')}")
+            self._push_role("review_failed", name,
+                            f"🔁 {name} failed review — fix round {event.get('round')}")
         elif etype == "agent_done":
             name = event.get("agent", "")
             row = self._row_for(name)
@@ -338,9 +402,12 @@ class Notifier:
             self._log.append(f"{name} {event.get('status')} · "
                              f"{event.get('rounds')} round(s)")
             self._notify_agent_done(name, event)
-            self._push("agent_done",
-                       f"{name} — {self._status_phrase(str(event.get('status', '')), event.get('rounds', '?'))}"
-                       f" · wave {row.wave}")
+            head = (f"{name} — "
+                    f"{self._status_phrase(str(event.get('status', '')), event.get('rounds', '?'))}"
+                    f" · wave {row.wave}")
+            work = _tail_summary(str(event.get("text", "")))
+            self._push_role("agent_done", name,
+                            head + (f"\n{work}" if work else ""))
         elif etype == "wave_done":
             ok = bool(event.get("passed"))
             self._log.append(f"wave {event.get('wave')} "

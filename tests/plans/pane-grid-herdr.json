@@ -1,0 +1,47 @@
+{
+  "name": "pane-grid-herdr",
+  "cwd": ".",
+  "display": "herdr",
+  "on_failure": "continue",
+  "orchestrator": {"model": "openai-codex/gpt-5.6-luna", "thinking": "low"},
+  "waves": [
+    [
+      {
+        "name": "grid-1",
+        "prompt": "Layout smoke test. Reply with exactly this text and nothing else: PANE-1-OK",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PANE-1-OK",
+        "timeout": 120
+      },
+      {
+        "name": "grid-2",
+        "prompt": "Layout smoke test. Reply with exactly this text and nothing else: PANE-2-OK",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PANE-2-OK",
+        "timeout": 120
+      },
+      {
+        "name": "grid-3",
+        "prompt": "Layout smoke test. Reply with exactly this text and nothing else: PANE-3-OK",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PANE-3-OK",
+        "timeout": 120
+      },
+      {
+        "name": "grid-4",
+        "prompt": "Layout smoke test. Reply with exactly this text and nothing else: PANE-4-OK",
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "off",
+        "files": [],
+        "done_when": "final message is exactly PANE-4-OK",
+        "timeout": 120
+      }
+    ]
+  ]
+}

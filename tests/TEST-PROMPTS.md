@@ -160,6 +160,53 @@ This run rewrites `research.py`, `frontend.py`, `qa.py`, `security.py` in
 the repo root (that's expected — `review_cmd` on each checks they import
 cleanly).
 
+## Level 4d — pane grid layout + the 4-per-wave cap (`display: "herdr"`)
+
+Verifies the tiling: the orchestrator splits the engine pane **right**, the
+first assignment splits **down** off it to open the row, and every later
+assignment fills **right** along that same row — so one wave of 4 agents lays
+out as one wide orchestrator on top with a 4-pane row beneath it:
+
+```
++---+--------------------+
+| E |         O          |
+|   +----+----+----+-----+
+|   | g1 | g2 | g3 | g4  |
++---+----+----+----+-----+
+```
+
+Free check first (both must load; the cap is a dispatch-time guard, not a
+load-time one, so even the 5-agent plan passes `--dry-run`):
+
+```bash
+python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/pane-grid-herdr.json --dry-run
+python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/pane-grid-over-cap-herdr.json --dry-run
+```
+
+**4d-i — the grid (4 agents = the cap, all dispatch).** With pi running in a
+Herdr pane, paste:
+
+> เรียกใช้ tool dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/pane-grid-herdr.json แล้วรอจนได้ summary จริง ๆ จากนั้นบอกผม pane id ของ orchestrator กับของ grid-1..grid-4 และ status ของแต่ละตัว ห้ามทำ assignment เอง ห้ามแก้ไฟล์ plan
+
+Expected: 5 panes open with **no** `stopped` event — a wide orchestrator pane
+to the right, then `grid-1` directly below it, and `grid-2`/`grid-3`/`grid-4`
+added to the right of it on the same row (eyeball the pane layout: the four
+`grid-*` panes share one horizontal row under the orchestrator, none stacked
+in a second column). Each `grid-N` pane shows `PANE-N-OK`, the summary has
+all four at `status: "pass"` (the orchestrator judged the exact-match
+`done_when`), overall `status: "completed"`, plus a `synthesis`. This is the
+boundary case: 4 herdr agents in one wave is exactly the cap and must run.
+
+**4d-ii — one past the cap (5 agents → stop before dispatch).** Same pane,
+paste:
+
+> เรียกใช้ tool dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/pane-grid-over-cap-herdr.json แล้วรายงานว่าเกิดอะไรขึ้น (ดูใน events ว่ามี wave_start ไหม และเหตุผลใน stopped)
+
+Expected: the engine refuses at dispatch — a `stopped` event whose reason says
+`4 agents per wave`, **no** `wave_start`, and summary `status: "stopped"`. No
+`grid-*` agent is ever prompted (the guardrail is in the engine, not
+prompt-level). If instead all 5 panes spawn, the cap regressed.
+
 ## Level 5 — wigolo research over MCP (`mcp_config`)
 
 This is the only unproven link: an assignment agent actually starting the
@@ -204,6 +251,78 @@ calling wigolo tools (`search` / `fetch`); summary reports `display: "herdr"`,
 > เรียก dispatch_wave ด้วย plan ~/labs/pi-wave/tests/plans/research-wigolo.json แต่อย่าทำงานเอง — สรุปว่า agent ตอบว่าอะไร
 
 Expected on a healthy setup: pass with citations (headless — no pane opens).
+
+## Level 6 - Grok Bot chat push (`PI_WAVE_CHAT_PUSH=on`)
+
+Checks that digests really land in Grok Bot, from pi, cheapest first.
+Before you start: Grok Bot is open with the chat you want to watch, and the
+app hosting pi has Accessibility permission (otherwise stderr shows
+`not allowed to send keystrokes`). Don't type while a run is going - every
+push steals focus and pastes.
+
+Every level below routes all role digests into the same Grok Bot
+(`PI_WAVE_CHAT_ROLE_APP="Grok Bot"`), so you don't need an app per role:
+
+```bash
+PI_WAVE_CHAT_PUSH=on PI_WAVE_CHAT_ROLE_APP="Grok Bot" pi
+```
+
+**6a - plumbing, 0 tokens (probe errors immediately, no agent spawns).**
+Start pi **outside Herdr** for this one: inside Herdr, `display: auto` opens
+a real OMP pane, and the probe ends `🚫 blocked on an approval dialog`
+instead of `💥 error` (the pane stays open - close it yourself).
+
+> ใช้ dispatch_wave รัน inline plan นี้ตรง ๆ ห้ามแก้ไข: {"name":"push-plumbing-test","cwd":".","on_failure":"continue","waves":[[{"name":"probe","prompt":"noop","model":"claude-sonnet-5","kind":"omp"}]]} มันตั้งใจให้ fail ทันทีเพื่อทดสอบ push เข้า Grok Bot รันแล้วสรุป summary สั้น ๆ ห้ามทำ assignment เอง
+
+Expected in Grok Bot, in order, 4 messages:
+`🚀 pi-wave push-plumbing-test started — 1 waves · 1 roles` →
+`probe — 💥 error · wave 1` → `🏁 wave 1/1 — FAILED` →
+a multi-line `📋 pi-wave push-plumbing-test ... — 0/1 roles passed` with a
+`💥 probe` line. A multi-line message that arrives as separate messages
+means Enter sends too early - rerun with `PI_WAVE_CHAT_SEND_KEY=cmd+return`.
+Messages missing their first word means the paste went in before the app
+was ready - raise `PI_WAVE_CHAT_DELAY`.
+
+**6b - role summary line (1 luna call):**
+
+> เรียกใช้ tool dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/smoke-1-agent.json แล้วสรุปผลจาก summary ห้ามทำ assignment เอง (ผมกำลังดูว่า push ใน Grok Bot มีบรรทัดสรุปงานของ role ไหม)
+
+Expected: the `agent_done` push is **2 lines**:
+`wave-1-smoke — ✅ passed · 1 round(s) · wave 1` then `PI-WAVE-SMOKE-OK`
+(the agent's last line). If only the first line shows up, `_tail_summary`
+or the agent's `text` in the event is broken.
+
+**6c - review_failed + stop-on-failure through the bot (~3 luna calls):**
+
+> เรียก dispatch_wave ด้วย plan ~/labs/pi-wave/tests/plans/fix-round-always-fails.json แล้วสรุปว่า wave 2 ถูก dispatch หรือไม่ ห้ามทำ assignment เอง
+
+Expected in Grok Bot: `🔁 wave-1-fixer failed review — fix round 1` and
+`... fix round 2`, then `wave-1-fixer — ❌ failed after 3 rounds · wave 1`
+followed by `ATTEMPTED`, `🏁 wave 1/2 — FAILED`, and the summary digest.
+**No** push mentions `wave-2-never-runs` - if one does, stop-on-failure
+regressed.
+
+**6d - event filter + kill switch (1 luna call each):**
+
+```bash
+PI_WAVE_CHAT_PUSH=on PI_WAVE_CHAT_ROLE_APP="Grok Bot" PI_WAVE_CHAT_EVENTS=summary pi
+```
+
+Run the 6b prompt again → exactly **1** message (the `📋` summary). Then
+start pi with no `PI_WAVE_CHAT_PUSH` and run 6b again → **0** messages in
+Grok Bot, but `~/.pi-wave/progress/latest/dashboard.md` is still updated.
+
+**6e - the bot reads the dashboard back (pull, 0 pi-wave tokens):** after
+6c, paste into Grok Bot (not pi):
+
+> อ่านไฟล์ ~/.pi-wave/progress/latest/dashboard.md แล้วบอกว่า role ไหน fail กี่ round และ feedback จาก review_cmd ว่าอะไร
+
+Expected: the bot says `wave-1-fixer` failed after 3 rounds with
+`DELIVERABLE MISSING: this review always fails on purpose`. More pull
+prompts: `examples/grok-bot-prompts.md`.
+
+Per-role routing (1 app or 1 chat per role, `PI_WAVE_CHAT_ROLE_URL`) is in
+`examples/pi-prompts.md` sections 4-5, and costs a full role-split run.
 
 ## Cost notes
 

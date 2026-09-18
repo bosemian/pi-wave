@@ -33,9 +33,14 @@ class FakeMac:
 class FakeChat:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.calls: list[tuple[str, str | None]] = []
+        self.urls: list[tuple[str, str | None]] = []
 
-    def push(self, text: str) -> None:
+    def push(self, text: str, app: str | None = None,
+             url: str | None = None) -> None:
         self.messages.append(text)
+        self.calls.append((text, app))
+        self.urls.append((text, url))
 
     def close(self, timeout: float = 10.0) -> None:
         pass
@@ -66,11 +71,13 @@ EVENTS = [
     {"type": "agent_start", "agent": "qa", "wave": 1,
      "model": "kimi-coding/k3", "display": "headless"},
     {"type": "progress", "agent": "research", "turn": 1},
-    {"type": "agent_done", "agent": "research", "status": "pass", "rounds": 1},
+    {"type": "agent_done", "agent": "research", "status": "pass", "rounds": 1,
+     "text": "Explored options.\nCreated research.py with SERVICE_DESIGN and tradeoffs()."},
     {"type": "review_failed", "agent": "qa", "round": 1,
      "review_output_tail": "2 tests failed:\n- test_a\n- test_b"},
     {"type": "progress", "agent": "qa", "turn": 2},
-    {"type": "agent_done", "agent": "qa", "status": "pass", "rounds": 2},
+    {"type": "agent_done", "agent": "qa", "status": "pass", "rounds": 2,
+     "text": "Fixed the failing checks.\nAll 4 qa checks pass now."},
     {"type": "wave_done", "wave": 1, "passed": True},
     {"type": "summary", "plan": "t", "cwd": "/tmp/proj", "status": "completed",
      "waves": [{"wave": 1, "agents": [
@@ -219,12 +226,58 @@ class TestChatPush(unittest.TestCase):
         self.assertIn("🚀 pi-wave t started — 1 waves · 2 roles", texts)
         self.assertIn("🔁 qa failed review — fix round 1", texts)
         self.assertIn("research — ✅ passed · 1 round(s) · wave 1", texts)
+        # the role digest carries the work summary (agent's last line)
+        self.assertIn("Created research.py with SERVICE_DESIGN and tradeoffs().", texts)
         self.assertIn("qa — ✅ passed · 2 round(s) · wave 1", texts)
         self.assertIn("🏁 wave 1/1 — all passed", texts)
         summary = [m for m in chat.messages if m.startswith("📋")][0]
         self.assertIn("completed — 2/2 roles passed", summary)
         self.assertIn("✅ research · 1 round(s)", summary)
         self.assertIn("synthesis: All agents passed", summary)
+
+    def test_per_role_digests_go_to_role_bot(self):
+        chat = FakeChat()
+        n = Notifier(self.plan, Path(self.tmp) / "run", None, chat=chat)
+        for ev in EVENTS:
+            n.handle(ev)
+        n.close()
+        # per-role events (agent_done, review_failed) → a bot named per role
+        self.assertEqual({app for _, app in chat.calls if app is not None},
+                         {"research", "qa"})
+        research = [t for t, a in chat.calls if a == "research"]
+        self.assertTrue(any("Created research.py" in t for t in research))
+        self.assertTrue(any("failed review" in t
+                            for t, a in chat.calls if a == "qa"))
+        # run-level digests stay on the default app (app=None here)
+        run_level = [t for t, a in chat.calls if a is None]
+        self.assertTrue(any(t.startswith("🚀") for t in run_level))
+        self.assertTrue(any(t.startswith("📋") for t in run_level))
+
+    def test_role_app_template(self):
+        chat = FakeChat()
+        n = Notifier(self.plan, Path(self.tmp) / "run", None, chat=chat,
+                     role_app_tmpl="Grok · {role}")
+        n.handle(EVENTS[5])  # research agent_done
+        n.close()
+        self.assertIn("Grok · research", [a for _, a in chat.calls])
+
+    def test_role_url_routes_to_per_chat(self):
+        chat = FakeChat()
+        n = Notifier(self.plan, Path(self.tmp) / "run", None, chat=chat,
+                     role_url_tmpl="grok://chat/{role}")
+        for ev in EVENTS:
+            n.handle(ev)
+        n.close()
+        # per-role digests open the role's own chat URL, not an app name
+        self.assertEqual({url for _, url in chat.urls if url is not None},
+                         {"grok://chat/research", "grok://chat/qa"})
+        research_urls = [t for t, u in chat.urls if u == "grok://chat/research"]
+        self.assertTrue(any("Created research.py" in t for t in research_urls))
+        # app-name routing is bypassed for per-role pushes
+        self.assertEqual([a for _, a in chat.calls if a is not None], [])
+        # run-level digests still carry neither app nor url
+        run_level = [t for t, u in chat.urls if u is None]
+        self.assertTrue(any(t.startswith("🚀") for t in run_level))
 
     def test_event_filter_limits_pushes(self):
         chat = FakeChat()
@@ -246,6 +299,15 @@ class TestChatPush(unittest.TestCase):
         self.assertIn("keystroke return with command down", script)
         p.close()
 
+    def test_script_opens_url_when_given(self):
+        p = ChatPusher()
+        script = p._script("hi", url="grok://chat/frontend")
+        self.assertIn(
+            'do shell script "open " & quoted form of "grok://chat/frontend"',
+            script)
+        self.assertNotIn("to activate", script)
+        p.close()
+
     def test_create_enables_chat_from_env(self):
         env = {"PI_WAVE_PROGRESS_DIR": str(Path(self.tmp) / "p"),
                "PI_WAVE_NOTIFY": "off",
@@ -257,6 +319,8 @@ class TestChatPush(unittest.TestCase):
                 self.assertIsNotNone(n)
                 self.assertIsInstance(n._chat, ChatPusher)
                 self.assertEqual(n._chat._app, "TestApp")
+                self.assertEqual(n._role_app_tmpl, "{role}")
+                self.assertEqual(n._role_url_tmpl, "")
             finally:
                 if n is not None:
                     n.close()
