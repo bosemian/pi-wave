@@ -404,6 +404,8 @@ export class Notifier {
       this.log.push(`${event.agent} turn ${event.turn}`);
     } else if (etype === "prompt_stall_recovery") {
       this.log.push(`${event.agent} prompt stalled - recovering`);
+    } else if (etype === "prompt_submit_enter") {
+      this.log.push(`${event.agent} prompt left unsent - pressed Enter`);
     } else if (etype === "review_failed") {
       const name = String(event.agent ?? "");
       const row = this.roles.get(name);

@@ -53,7 +53,7 @@ export class HerdrPaneBusy extends HerdrError {
   override name = "HerdrPaneBusy";
 }
 
-export const sleep =(s: number) => new Promise<void>((resolve) => setTimeout(resolve, s * 1000));
+export const sleep = (s: number) => new Promise<void>((resolve) => setTimeout(resolve, s * 1000));
 
 const expandUser = (p: string) =>
   p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
@@ -147,20 +147,23 @@ export function findKey(obj: unknown, key: string): any {
 const head = (args: string[]) => args.slice(0, 3).join(" ");
 
 /** Where an agent was before a prompt: its pane scrollback (for the
- * wait-for-done fallback), how many replies its session held, and whether
- * it was still mid-turn (its session's last message is not a reply). */
+ * wait-for-done fallback), how many prompts and replies its session held,
+ * and whether it was still mid-turn (its session's last message is not a
+ * reply). */
 export interface Checkpoint {
   scrollback: string;
+  prompts: number;
   replies: number;
   busy: boolean;
 }
 
 /** The replies in a pi or OMP session file (both write the same entries),
- * in order, and whether its last message leaves a turn open. A reply is an
+ * in order, how many prompts (user messages) it received, and whether its
+ * last message leaves a turn open. A reply is an
  * assistant message that ended its turn: one that stopped for tool use is
  * mid-turn, the agent keeps going after the tool results. A missing file
  * (nothing sent yet) has none; a line still being written is skipped. */
-function sessionReplies(file: string | null): { replies: string[]; busy: boolean } {
+function sessionReplies(file: string | null): { replies: string[]; prompts: number; busy: boolean } {
   let raw = "";
   try {
     if (file) raw = readFileSync(file, "utf8");
@@ -168,6 +171,7 @@ function sessionReplies(file: string | null): { replies: string[]; busy: boolean
     // not created yet
   }
   const replies: string[] = [];
+  let prompts = 0;
   let busy = false;
   for (const line of raw.split("\n")) {
     let entry: Json;
@@ -178,12 +182,13 @@ function sessionReplies(file: string | null): { replies: string[]; busy: boolean
     }
     const msg = entry?.type === "message" ? entry.message : null;
     if (!msg) continue;
+    if (msg.role === "user") prompts += 1;
     busy = msg.role !== "assistant" || msg.stopReason === "toolUse";
     if (busy) continue;
     const content: Json[] = Array.isArray(msg.content) ? msg.content : [];
     replies.push(content.filter((c) => c.type === "text").map((c) => c.text ?? "").join(""));
   }
-  return { replies, busy };
+  return { replies, prompts, busy };
 }
 
 export class HerdrBackend {
@@ -481,8 +486,19 @@ export class HerdrBackend {
 
   /** Snapshot taken before a prompt; pass it to reply() afterwards. */
   async checkpoint(name: string): Promise<Checkpoint> {
-    const { replies, busy } = sessionReplies(this.sessionFile(name));
-    return { scrollback: await this.read(name), replies: replies.length, busy };
+    const { replies, prompts, busy } = sessionReplies(this.sessionFile(name));
+    return { scrollback: await this.read(name), prompts, replies: replies.length, busy };
+  }
+
+  /** Submit a prompt still sitting in the agent's editor: if its session
+   * received no prompt since `since`, press Enter once. omp v18 keeps a big
+   * paste as a collapsed attachment (📄 #1) that herdr's own Enter does not
+   * submit (confirmed live); Enter on an empty editor does nothing. Returns
+   * whether it pressed Enter. */
+  async submitPending(name: string, since: Checkpoint): Promise<boolean> {
+    if (sessionReplies(this.sessionFile(name)).prompts > since.prompts) return false;
+    await this.runJson(["agent", "send-keys", name, "Enter"]);
+    return true;
   }
 
   /** The agent's answer to the prompt sent after `since`.

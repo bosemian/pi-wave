@@ -231,7 +231,7 @@ function scriptedReads(script: string[]): () => string {
   return () => script[n++] ?? `working ${n}`;
 }
 
-const before = { scrollback: "empty pane", replies: 0, busy: false };
+const before = { scrollback: "empty pane", prompts: 0, replies: 0, busy: false };
 
 describe("waitDone without a session file", () => {
   it("returns once the pane changed and then held still for the quiet period", async () => {
@@ -478,6 +478,20 @@ describe("replies from pi session files", () => {
     assert.equal(await b.reply("builder", since, 2, 0.01), "done");
   });
 
+  it("presses Enter for a fix round still in omp's editor, not for one it received", async () => {
+    // nasa-site-qa-retry-2: qa2 answered its first prompt, then a 140-line
+    // FIX ROUND sat in the editor as a collapsed paste (📄 #2)
+    const b = new SessionBackend();
+    await b.startAgent("qa2", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
+    const file = ompSession(b.sessionArg("--session-dir")!, user("review the site") + assistant("QA: all pass", "stop"));
+    const since = await b.checkpoint("qa2");
+    assert.equal(since.prompts, 1);
+    assert.equal(await b.submitPending("qa2", since), true);
+    assert.deepEqual(b.cmd, ["agent", "send-keys", "qa2", "Enter"]);
+    appendFileSync(file, user("FIX ROUND 1/2"));
+    assert.equal(await b.submitPending("qa2", since), false);
+  });
+
   it("reads an omp agent's reply from its session, not the pane", async () => {
     // reading the pane returned OMP's splash screen as the agent's answer
     const b = new SessionBackend();
@@ -512,7 +526,7 @@ describe("waitDone with a session file", () => {
     const b = new SessionBackend();
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
     const dir = b.sessionArg("--session-dir")!;
-    const since = { scrollback: "shell prompt", replies: 0, busy: false };
+    const since = { scrollback: "shell prompt", prompts: 0, replies: 0, busy: false };
     // the pane ("pane scrollback") never moves again after its first change:
     // a pane-only check would have called this done straight away
     const file = ompSession(dir, user("check the site") + assistant("", "toolUse"));
@@ -528,14 +542,14 @@ describe("waitDone with a session file", () => {
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
     let n = 0;
     b.read = async () => `working ${n++}`;
-    await assert.rejects(b.waitDone("qa", { scrollback: "", replies: 0, busy: false }, 0.1, 0.02, 0.01), (e: Error) =>
+    await assert.rejects(b.waitDone("qa", { scrollback: "", prompts: 0, replies: 0, busy: false }, 0.1, 0.02, 0.01), (e: Error) =>
       e instanceof AgentTimeoutError && e.message.includes("still working"));
   });
 
   it("times out as gone quiet when the pane stopped changing without a reply", async () => {
     const b = new SessionBackend();
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
-    await assert.rejects(b.waitDone("qa", { scrollback: "", replies: 0, busy: false }, 0.1, 0.02, 0.01, 0.03), (e: Error) =>
+    await assert.rejects(b.waitDone("qa", { scrollback: "", prompts: 0, replies: 0, busy: false }, 0.1, 0.02, 0.01, 0.03), (e: Error) =>
       e instanceof AgentTimeoutError && e.message.includes("without finishing a reply"));
   });
 });

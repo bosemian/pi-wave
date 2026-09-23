@@ -57,7 +57,7 @@ class RecordingBackend {
     this.prompts.push(text);
   }
   async checkpoint() {
-    return { scrollback: "", replies: 0, busy: false };
+    return { scrollback: "", prompts: 0, replies: 0, busy: false };
   }
   async reply() {
     return "ok";
@@ -172,7 +172,10 @@ class FakeHerdrBackend implements HerdrLike {
     if (outcome) throw outcome;
   }
   async checkpoint() {
-    return { scrollback: "before", replies: 0, busy: this.busy };
+    return { scrollback: "before", prompts: 0, replies: 0, busy: this.busy };
+  }
+  async submitPending() {
+    return false;
   }
   async reply() {
     return "all done";
@@ -313,7 +316,7 @@ class OmpReplay extends HerdrBackend {
   constructor() {
     super("/tmp");
   }
-  protected override async runJson(args: string[]) {
+  protected override async runJson(args: string[]): Promise<Json> {
     if (args[1] === "split") return { result: { pane: { pane_id: "w1:pZ" } } };
     if (args[1] === "start") {
       this.ompDir = args[args.indexOf("--session-dir") + 1]!;
@@ -359,6 +362,72 @@ describe("omp completion (nasa-site replay)", () => {
     } finally {
       clearTimeout(answer);
     }
+  });
+});
+
+/** OmpReplay of the second nasa-site qa run (omp v18.2.11, captured live):
+ * a big prompt lands in omp's editor as a collapsed paste (📄 #1) and the
+ * Enter herdr sends with it does not submit it. omp's session exists from
+ * launch but gains no user message until one more Enter arrives. */
+class OmpStuckPaste extends OmpReplay {
+  enters = 0;
+  /** true: the prompt itself submits (a smaller paste) and only herdr's
+   * status check stalls, as in the first nasa-site qa run. */
+  private readonly submits: boolean;
+  constructor(submits = false) {
+    super();
+    this.submits = submits;
+  }
+  protected override async runJson(args: string[]) {
+    if (args[1] === "start") {
+      const resp = await super.runJson(args);
+      mkdirSync(this.ompDir, { recursive: true });
+      writeFileSync(this.file(), JSON.stringify({ type: "session" }) + "\n");
+      return resp;
+    }
+    if (args[1] === "prompt" && this.submits) this.answer(args[3]!);
+    if (args[1] === "send-keys" && args[3] === "Enter") {
+      this.enters += 1;
+      this.answer(this.prompts.at(-1)!);
+      return { result: { type: "ok" } };
+    }
+    return super.runJson(args);
+  }
+  private answer(prompt: string) {
+    const msg = (role: string, text: string) =>
+      JSON.stringify({ type: "message", message: { role, stopReason: "stop", content: [{ type: "text", text }] } }) + "\n";
+    appendFileSync(this.file(), msg("user", prompt) + msg("assistant", "QA REPORT: all good"));
+  }
+  private file() {
+    return path.join(this.ompDir, "2026-09-23T10-46-16-000Z_01a0cdd8.jsonl");
+  }
+}
+
+describe("omp prompt left in the editor (nasa-site replay)", () => {
+  it("presses Enter once when omp's session never received the prompt", async () => {
+    const fake = new OmpStuckPaste();
+    const plan = writePlan({
+      waves: [[{ name: "qa", prompt: "review the site", model: "claude-sonnet-5", kind: "omp", files: [], display: "herdr" }]],
+    });
+    const events: Json[] = [];
+    const res = await runAssignmentHerdr(plan.waves[0]![0]!, 0, plan, new Map(), (e) => events.push(e), null, null,
+      fakeDeps({ herdrBackend: () => fake }));
+    assert.equal(res.status, "pass", res.error);
+    assert.equal(res.text, "QA REPORT: all good");
+    assert.equal(fake.enters, 1);
+    assert.equal(fake.prompts.length, 1);
+    assert.equal(count(events, "prompt_submit_enter"), 1);
+  });
+
+  it("does not press Enter when omp's session shows the prompt arrived", async () => {
+    const fake = new OmpStuckPaste(true);
+    const plan = writePlan({
+      waves: [[{ name: "qa", prompt: "review the site", model: "claude-sonnet-5", kind: "omp", files: [], display: "herdr" }]],
+    });
+    const res = await runAssignmentHerdr(plan.waves[0]![0]!, 0, plan, new Map(), () => {}, null, null,
+      fakeDeps({ herdrBackend: () => fake }));
+    assert.equal(res.status, "pass", res.error);
+    assert.equal(fake.enters, 0);
   });
 });
 
@@ -624,7 +693,10 @@ class ScriptedHerdr implements HerdrLike {
     this.prompts.push({ name, text });
   }
   async checkpoint() {
-    return { scrollback: "", replies: 0, busy: false };
+    return { scrollback: "", prompts: 0, replies: 0, busy: false };
+  }
+  async submitPending() {
+    return false;
   }
   async reply(name: string) {
     return this.scripts[name]?.shift() ?? `${name} done`;

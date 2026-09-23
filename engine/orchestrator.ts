@@ -147,7 +147,7 @@ export const MAX_SYNC_ROUNDS = 2;
 /** The parts of HerdrBackend the engine drives (tests pass fakes). */
 export type HerdrLike = Pick<
   HerdrBackend,
-  "splitPane" | "startAgent" | "prompt" | "checkpoint" | "reply" | "waitLateStart" | "waitSettled" | "waitDone"
+  "splitPane" | "startAgent" | "prompt" | "checkpoint" | "reply" | "waitLateStart" | "waitSettled" | "waitDone" | "submitPending"
 >;
 /** The parts of PiRpcSession the engine drives (tests pass fakes). */
 export type SessionLike = Pick<
@@ -441,7 +441,9 @@ export class OrchestratorPane {
  * already working or already done, risking duplicate work - observed live
  * as the pane running the assignment twice. So for omp, one stall goes
  * straight to the wait-for-done fallback; kind=pi (whose status field is
- * reliable) keeps resending once before falling back. */
+ * reliable) keeps resending once before falling back. Before that wait,
+ * an omp prompt its session never received is still in the editor (a big
+ * paste herdr's Enter did not submit) and gets one more Enter. */
 async function promptHerdr(
   backend: HerdrLike,
   a: Assignment,
@@ -477,6 +479,9 @@ async function promptHerdr(
   // agent may well be working anyway, so wait for its session reply (or
   // its pane to settle) for as long as the assignment allows; see
   // HerdrBackend.waitDone.
+  if (a.kind === "omp" && (await backend.submitPending(a.name, since))) {
+    emit({ type: "prompt_submit_enter", agent: a.name });
+  }
   emit({ type: "prompt_stall_pane_check", agent: a.name, watch_s: watchS, timeout_s: a.timeout });
   await backend.waitDone(a.name, since, a.timeout, watchS);
 }
