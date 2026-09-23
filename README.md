@@ -6,24 +6,26 @@ Instead of an LLM orchestrator typing `herdr` commands, this program spawns wave
 `pi --mode rpc` subagents, reviews results against definitions of done, runs consolidated
 fix rounds, and returns one structured summary.
 
-Python ≥ 3.12, **zero dependencies** (stdlib asyncio only).
+TypeScript on Node ≥ 24 (runs `.ts` directly, no build step), **zero runtime dependencies**.
 
 ## Architecture
 
 ```
 pi agent (your orchestrator thread)
-  └─ calls tool: dispatch_wave { plan: "/abs/plan.json" }
-       └─ extension/dispatch-wave.ts
-            └─ spawn: python3 run.py <plan.json>
-                 └─ per assignment: spawn pi --mode rpc --no-session --no-extensions
-                      ├─ prompt → agent_settled → get_last_assistant_text
-                      ├─ review_cmd exit code? fail → ONE consolidated fix prompt (max N)
-                      └─ get_session_stats (tokens/cost) → terminate
+  └─ calls tool: dispatch_wave { plan: {...} | "/abs/plan.json" }
+       └─ extension/dispatch-wave.ts  →  engine/ (in the same pi process)
+            └─ per assignment: spawn pi --mode rpc --no-session --no-extensions
+                 ├─ prompt → agent_settled → get_last_assistant_text
+                 ├─ review_cmd exit code? fail → ONE consolidated fix prompt (max N)
+                 └─ get_session_stats (tokens/cost) → terminate
+
+terminal:  node engine/cli.ts <plan.json>  →  the same engine/, events as JSONL on stdout
 ```
 
-stdout of the engine is pure JSONL (`plan_start`, `wave_start`, `agent_progress`,
-`agent_done`, `wave_done`, `summary`); the extension forwards every line as a tool
-update and returns the `summary` object as the tool result.
+The engine emits events (`plan_start`, `wave_start`, `agent_progress`,
+`agent_done`, `wave_done`, `summary`); the extension forwards each one as a
+tool update and returns the `summary` object as the tool result, and the CLI
+prints them as JSONL on stdout.
 
 ## Quick start
 
@@ -31,13 +33,13 @@ update and returns the `summary` object as the tool result.
 # validate a plan without spending tokens — works from any directory.
 # A plan with no "cwd" (or "cwd": ".") anchors agents to the directory
 # you launch from — not the pi-wave repo.
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/examples/example-plan.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/examples/example-plan.json --dry-run
 
 # run it (spawns real pi agents — costs API tokens)
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/examples/example-plan.json
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/examples/example-plan.json
 
 # run the same plan on a different model/thinking without editing it
-python3 run.py examples/example-plan.json --model anthropic/claude-x --thinking low
+node engine/cli.ts examples/example-plan.json --model anthropic/claude-x --thinking low
 # (--model/--provider/--thinking replace that field on EVERY assignment;
 #  an unqualified --model needs --provider, same rule as the plan schema)
 ```
@@ -152,7 +154,7 @@ Opt-in because the trade-offs are real:
   keystrokes` and a hint on stderr
 
 ```bash
-PI_WAVE_CHAT_PUSH=on python3 run.py examples/role-split-plan.json
+PI_WAVE_CHAT_PUSH=on node engine/cli.ts examples/role-split-plan.json
 ```
 
 | Env | Default | Notes |
@@ -171,11 +173,10 @@ No absolute paths anywhere in the repo. Conventions:
 
 - Plans use `"cwd": "."` (resolved at invocation) or `"~/..."` (expanded by the
   engine) — never `/Users/...`.
-- The extension resolves its home via `os.homedir()`; override with
-  `PI_WAVE_HOME`. The MCP adapter entry defaults to
+- The extension loads the engine relative to itself (`../engine`), so it
+  runs from wherever the repo lives. The MCP adapter entry defaults to
   `~/.pi/agent/npm/node_modules/pi-mcp-adapter/index.ts`; override with
   `PI_WAVE_MCP_ADAPTER`.
-- `PI_WAVE_PYTHON` overrides the interpreter (default `python3`).
 
 ## Wave plan schema
 
@@ -282,8 +283,6 @@ every single OMP stall. Fixed by skipping the resend for `kind: "omp"`
   re-prompt to the originating agent's session, at most `max_fix_rounds` times.
 - **Stop on failure** — with the default `on_failure: "stop"`, a wave that fails
   review halts later waves and the summary reports the state honestly.
-- **Dialogs are never answered** — any `extension_ui_request` policy in the engine
-  is refuse-by-default (`cancelled: true`); the engine never pretends to be you.
 
 ## Install the extension (trigger from inside a pi agent)
 
@@ -292,19 +291,21 @@ every single OMP stall. Fixed by skipping the resend for `kind: "omp"`
 pi -e ~/labs/pi-wave/extension/dispatch-wave.ts
 # then ask the agent: "Run dispatch_wave with the plan at ~/labs/pi-wave/examples/example-plan.json"
 
-# install globally
-mkdir -p ~/.pi/agent/extensions
-cp ~/labs/pi-wave/extension/dispatch-wave.ts ~/.pi/agent/extensions/
+# install globally: add the repo's extension directory to ~/.pi/agent/settings.json
+#   { "extensions": ["~/labs/pi-wave/extension"] }
+# (don't copy the file - it imports ../engine)
 ```
 
-Env overrides: `PI_WAVE_HOME` (default `~/labs/pi-wave`), `PI_WAVE_PYTHON`
-(default `python3`). Abort inside pi propagates through the extension's
-`signal` → engine (SIGTERM) → all child `pi` processes.
+The engine runs inside pi's process. Abort inside pi (Esc) reaches the
+engine through the tool's `signal`: child `pi` processes are terminated,
+running `herdr` and `review_cmd` commands are killed, and no further waves
+start. Herdr panes stay open, as after a normal run.
 
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # plan validation + notifier, no network
+npm install                    # dev only: typescript + pi/typebox types
+npm test && npm run typecheck  # no network, no real pi (a fake pi stands in)
 ```
 
 ## Roadmap

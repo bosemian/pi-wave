@@ -6,7 +6,7 @@ Seed a dashboard first, then paste a prompt into the bot's chat.
 # quick, zero-cost (one role that errors instantly — just to have a live file)
 #   (write the one-line plan from README's Testing section or any plan)
 # real showcase (4 roles in one wave — costs API tokens):
-cd ~/labs/pi-wave && python3 run.py examples/role-split-plan.json
+cd ~/labs/pi-wave && node engine/cli.ts examples/role-split-plan.json
 ```
 
 Paths below use `~`; if your bot's file tool does not expand it, substitute

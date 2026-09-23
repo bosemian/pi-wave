@@ -1,0 +1,87 @@
+{
+  "name": "nasa-site",
+  "cwd": ".",
+  "on_failure": "stop",
+  "display": "herdr",
+  "waves": [
+    [
+      {
+        "name": "design",
+        "prompt": "Write the shared spec for a static, NASA-inspired space-exploration website that three builders will implement in parallel without talking to each other: one writes index.html, one styles.css, one app.js. Cover: (1) page sections in order - a hero with a mission name, a timeline of key missions (Apollo 11, Voyager 1, Hubble, JWST, Artemis), cards for the 8 planets, a stats band of 4 numbers, and a footer that says this is an unofficial fan page not affiliated with NASA; (2) every id and class that CSS or JS will reference, with the element it belongs to; (3) the palette as CSS custom properties - a dark space background with NASA blue #0b3d91 and red #fc3d21 as accents - and system-font typography; (4) JS behaviour - a canvas starfield behind the hero, stat numbers that count up when scrolled into view, and a menu button that opens the nav on narrow screens - including the data attributes JS reads; (5) responsive rules down to 375px wide, with Thai text wrapping and nothing overflowing horizontally; (6) all Thai copy verbatim. Read-only: do not create or modify any file; your final message IS the spec.",
+        "model": "openai-codex/gpt-5.5",
+        "thinking": "high",
+        "files": [],
+        "done_when": "the spec covers all six points and names every id/class precisely enough for three builders to work independently",
+        "timeout": 600
+      }
+    ],
+    [
+      {
+        "name": "html",
+        "prompt": "Write index.html from the design spec injected below: semantic sections, every id/class/data attribute from the spec, alt text and aria labels, <link href=\"styles.css\"> and <script src=\"app.js\" defer>. Use every id and class exactly as the design spec names them - the other two builders rely on the same names. No framework, no build step, nothing loaded from the internet (no CDN, no web fonts, no remote images). Never use NASA's official logo or insignia; draw all imagery with CSS, inline SVG or canvas. All visible copy is in Thai.",
+        "model": "kimi-coding/k3",
+        "thinking": "high",
+        "files": [
+          "index.html"
+        ],
+        "needs_results": [
+          "design"
+        ],
+        "review_cmd": "test -s index.html && grep -q 'href=\"styles.css\"' index.html && grep -q 'src=\"app.js\"' index.html && grep -qi 'unofficial' index.html",
+        "done_when": "index.html implements every section of the spec with the spec's ids and classes",
+        "timeout": 900
+      },
+      {
+        "name": "css",
+        "prompt": "Write styles.css from the design spec injected below: the palette as custom properties, layout for every section, and responsive rules so nothing overflows horizontally at 375px (long Thai text must wrap). Use every id and class exactly as the design spec names them - the other two builders rely on the same names. No framework, no build step, nothing loaded from the internet (no CDN, no web fonts, no remote images). Never use NASA's official logo or insignia; draw all imagery with CSS, inline SVG or canvas. All visible copy is in Thai.",
+        "model": "kimi-coding/k3",
+        "thinking": "high",
+        "files": [
+          "styles.css"
+        ],
+        "needs_results": [
+          "design"
+        ],
+        "review_cmd": "test -s styles.css && grep -q -- '--' styles.css && grep -q '@media' styles.css",
+        "done_when": "styles.css styles every id/class in the spec and is responsive down to 375px",
+        "timeout": 900
+      },
+      {
+        "name": "js",
+        "prompt": "Write app.js from the design spec injected below: the canvas starfield, the count-up stats on scroll (IntersectionObserver), and the mobile menu toggle that keeps aria-expanded in sync. Respect prefers-reduced-motion. Use every id and class exactly as the design spec names them - the other two builders rely on the same names. No framework, no build step, nothing loaded from the internet (no CDN, no web fonts, no remote images). Never use NASA's official logo or insignia; draw all imagery with CSS, inline SVG or canvas. All visible copy is in Thai.",
+        "model": "kimi-coding/k3",
+        "thinking": "high",
+        "files": [
+          "app.js"
+        ],
+        "needs_results": [
+          "design"
+        ],
+        "review_cmd": "node --check app.js",
+        "done_when": "app.js implements every behaviour in the spec using the spec's ids, classes and data attributes",
+        "timeout": 900
+      }
+    ],
+    [
+      {
+        "name": "qa",
+        "prompt": "Review the site in this directory visually and in code. (1) Take two screenshots with headless Chrome, then open and look at both images: \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --headless --disable-gpu --hide-scrollbars --screenshot=qa/desktop.png --window-size=1440,900 \"file://$PWD/index.html\" and the same with --screenshot=qa/mobile.png --window-size=375,812 (mkdir -p qa first). Judge what you see: clipped or overflowing text, broken layout, unreadable contrast, missing sections, anything that looks off. (2) Read index.html, styles.css and app.js and check that every id/class/data attribute the design spec names is used consistently in all three files, that every section of the spec exists, that nothing is loaded from the internet, and that images and controls have alt/aria. Do not modify index.html, styles.css or app.js. Reply with a list of issues, each with the file and line (or the screenshot and region), or exactly \"no issues\".",
+        "model": "claude-sonnet-5",
+        "kind": "omp",
+        "thinking": "high",
+        "files": [
+          "qa/desktop.png",
+          "qa/mobile.png"
+        ],
+        "needs_results": [
+          "design",
+          "html",
+          "css",
+          "js"
+        ],
+        "done_when": "both screenshots were taken and inspected and every check above is reported",
+        "timeout": 900
+      }
+    ]
+  ]
+}

@@ -7,13 +7,13 @@ Plans live in `tests/plans/`. `R=` repo root `~/labs/pi-wave`.
 
 ```bash
 cd ~/labs/pi-wave
-python3 run.py tests/plans/conflict.json --dry-run; echo "exit=$?"
+node engine/cli.ts tests/plans/conflict.json --dry-run; echo "exit=$?"
 ```
 
 Expected: `plan error: ... file conflict in wave 1: 'README.md' ...` and `exit=2`.
 
 ```bash
-python3 run.py examples/example-plan.json --dry-run; echo "exit=$?"
+node engine/cli.ts examples/example-plan.json --dry-run; echo "exit=$?"
 ```
 
 Expected: three `assignment` JSONL lines, `dry-run OK`, `exit=0`.
@@ -21,7 +21,7 @@ Expected: three `assignment` JSONL lines, `dry-run OK`, `exit=0`.
 ## Level 1 — cheap engine run (1 tiny luna call)
 
 ```bash
-python3 run.py tests/plans/smoke-1-agent.json; echo "exit=$?"
+node engine/cli.ts tests/plans/smoke-1-agent.json; echo "exit=$?"
 ```
 
 Expected: JSONL `plan_start → wave_start → agent_start → agent_progress →
@@ -33,7 +33,7 @@ agent_done (status pass) → wave_done → summary`, final text
 `review_cmd` always exits 1 on purpose, so:
 
 ```bash
-python3 run.py tests/plans/fix-round-always-fails.json; echo "exit=$?"
+node engine/cli.ts tests/plans/fix-round-always-fails.json; echo "exit=$?"
 ```
 
 Expected: `review_failed` at rounds 1 and 2, one consolidated FIX prompt per
@@ -42,8 +42,9 @@ round, `agent_done` with `status: "fail"` after 3 attempts, **no** wave 2
 
 ## Level 3 — extension path (from inside a pi agent)
 
-Start pi with the extension loaded (it is installed globally at
-`~/.pi/agent/extensions/dispatch-wave.ts`, so any fresh pi session has it):
+Start pi with the extension loaded (it is installed globally through
+`"extensions": ["~/labs/pi-wave/extension"]` in `~/.pi/agent/settings.json`,
+so any fresh pi session has it; the engine runs inside that pi process):
 
 ```bash
 pi -e ~/labs/pi-wave/extension/dispatch-wave.ts   # or just: pi
@@ -57,14 +58,15 @@ Then paste one of these prompts.
 
 **3b — dry-run first, then dispatch (tests both paths in one go):**
 
-> ทดสอบ pi-wave ให้หน่อย: (1) รันคำสั่ง python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/smoke-1-agent.json --dry-run แล้วตรวจว่าผ่าน (2) ถ้าผ่าน ให้เรียก dispatch_wave ด้วย plan เดียวกัน (3) สรุปสถานะของทุก agent จาก summary พร้อม tokens ที่ใช้ ห้ามทำ assignment เอง
+> ทดสอบ pi-wave ให้หน่อย: (1) รันคำสั่ง node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/smoke-1-agent.json --dry-run แล้วตรวจว่าผ่าน (2) ถ้าผ่าน ให้เรียก dispatch_wave ด้วย plan เดียวกัน (3) สรุปสถานะของทุก agent จาก summary พร้อม tokens ที่ใช้ ห้ามทำ assignment เอง
 
 **3c — conflict plan must be refused by the engine, not by you:**
 
 > เรียก dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/conflict.json แล้วรายงานว่าเกิดอะไรขึ้น
 
-Expected: the tool result contains the engine's plan error (file conflict,
-exit 2) — the *engine* refuses, proving the guardrail is not prompt-level.
+Expected: the tool call fails with the engine's `plan error: ... file conflict
+in wave 1: 'README.md' ...` - the *engine* refuses, proving the guardrail is
+not prompt-level.
 
 **3d — fix-round machinery via extension:**
 
@@ -76,22 +78,25 @@ wave 2 was never dispatched.
 **3e — abort propagation (manual):** start 3a, then press Esc/Ctrl+C in pi
 while the wave runs.
 
-Expected: the engine and its child pi processes die (check `pgrep -f "mode.*rpc"`),
-no orphaned agents.
+Expected: the tool call ends as aborted within a few seconds and its child pi
+processes die, no orphaned agents. pi renames its process to `pi`, so
+`pgrep -f "mode.*rpc"` never matches; check the children of the pi you ran
+instead: `pgrep -lP <pid of that pi>` must show no `pi` child left.
 
 ## Level 4 — Herdr panes (agents visible, `display: "herdr"`)
 
 The engine must run **inside** a Herdr pane (HERDR_ENV=1) — run pi in a Herdr
 pane and prompt it there; the engine inherits the caller context, splits the
 pane per agent (ratio 0.5), starts interactive pi in it, prompts via
-`herdr agent prompt --wait`, and reads the pane scrollback. Panes stay open
-after the run.
+`herdr agent prompt --wait`, and reads the reply from the agent's pi session
+file (`--session`; OMP agents, which have none, from the pane scrollback).
+Panes stay open after the run.
 
 Quick free check from a Herdr pane shell first (must fail with a clear error
 outside Herdr, succeed inside):
 
 ```bash
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/smoke-1-agent-herdr.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/smoke-1-agent-herdr.json --dry-run
 ```
 
 Then, with pi running in a Herdr pane, paste:
@@ -116,13 +121,13 @@ not rare — herdr's `agent_status` never leaves idle for `kind: "omp"` at
 all, so the status-based wake check always exhausts. This exercises the
 full recovery chain end-to-end on the OMP CLI itself: one stall →
 `prompt_stall_recovery` → status wait exhausts → `prompt_stall_pane_check`
-→ `HerdrBackend.wait_pane_settled` catches the real completion from the
+→ `HerdrBackend.waitPaneSettled` catches the real completion from the
 pane's own scrollback.
 
 Free check first:
 
 ```bash
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/smoke-1-agent-omp-herdr.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/smoke-1-agent-omp-herdr.json --dry-run
 ```
 
 Then, with pi running in a Herdr pane, paste:
@@ -179,8 +184,8 @@ Free check first (both must load; the cap is a dispatch-time guard, not a
 load-time one, so even the 5-agent plan passes `--dry-run`):
 
 ```bash
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/pane-grid-herdr.json --dry-run
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/pane-grid-over-cap-herdr.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/pane-grid-herdr.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/pane-grid-over-cap-herdr.json --dry-run
 ```
 
 **4d-i — the grid (4 agents = the cap, all dispatch).** With pi running in a
@@ -222,7 +227,7 @@ falls back to headless.
 
 ```bash
 npx -y wigolo@0.2.1 --version        # expect: wigolo 0.2.1
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/research-wigolo.json --dry-run
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/research-wigolo.json --dry-run
 ```
 
 Expected: dry-run prints `"mcp_config": "~/.config/mcp/wigolo.mcp.json"`.
@@ -230,7 +235,7 @@ Expected: dry-run prints `"mcp_config": "~/.config/mcp/wigolo.mcp.json"`.
 **5b — headless engine run (1 luna call + wigolo, no panes):**
 
 ```bash
-python3 ~/labs/pi-wave/run.py ~/labs/pi-wave/tests/plans/research-wigolo.json
+node ~/labs/pi-wave/engine/cli.ts ~/labs/pi-wave/tests/plans/research-wigolo.json
 ```
 
 Expected: summary `status: "pass"`, final text contains a wigolo version and
@@ -275,9 +280,9 @@ instead of `💥 error` (the pane stays open - close it yourself).
 > ใช้ dispatch_wave รัน inline plan นี้ตรง ๆ ห้ามแก้ไข: {"name":"push-plumbing-test","cwd":".","on_failure":"continue","waves":[[{"name":"probe","prompt":"noop","model":"claude-sonnet-5","kind":"omp"}]]} มันตั้งใจให้ fail ทันทีเพื่อทดสอบ push เข้า Grok Bot รันแล้วสรุป summary สั้น ๆ ห้ามทำ assignment เอง
 
 Expected in Grok Bot, in order, 4 messages:
-`🚀 pi-wave push-plumbing-test started — 1 waves · 1 roles` →
-`probe — 💥 error · wave 1` → `🏁 wave 1/1 — FAILED` →
-a multi-line `📋 pi-wave push-plumbing-test ... — 0/1 roles passed` with a
+`🚀 pi-wave push-plumbing-test started - 1 waves · 1 roles` →
+`probe - 💥 error · wave 1` → `🏁 wave 1/1 - FAILED` →
+a multi-line `📋 pi-wave push-plumbing-test ... - 0/1 roles passed` with a
 `💥 probe` line. A multi-line message that arrives as separate messages
 means Enter sends too early - rerun with `PI_WAVE_CHAT_SEND_KEY=cmd+return`.
 Messages missing their first word means the paste went in before the app
@@ -288,17 +293,17 @@ was ready - raise `PI_WAVE_CHAT_DELAY`.
 > เรียกใช้ tool dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/smoke-1-agent.json แล้วสรุปผลจาก summary ห้ามทำ assignment เอง (ผมกำลังดูว่า push ใน Grok Bot มีบรรทัดสรุปงานของ role ไหม)
 
 Expected: the `agent_done` push is **2 lines**:
-`wave-1-smoke — ✅ passed · 1 round(s) · wave 1` then `PI-WAVE-SMOKE-OK`
-(the agent's last line). If only the first line shows up, `_tail_summary`
+`wave-1-smoke - ✅ passed · 1 round(s) · wave 1` then `PI-WAVE-SMOKE-OK`
+(the agent's last line). If only the first line shows up, `tailSummary`
 or the agent's `text` in the event is broken.
 
 **6c - review_failed + stop-on-failure through the bot (~3 luna calls):**
 
 > เรียก dispatch_wave ด้วย plan ~/labs/pi-wave/tests/plans/fix-round-always-fails.json แล้วสรุปว่า wave 2 ถูก dispatch หรือไม่ ห้ามทำ assignment เอง
 
-Expected in Grok Bot: `🔁 wave-1-fixer failed review — fix round 1` and
-`... fix round 2`, then `wave-1-fixer — ❌ failed after 3 rounds · wave 1`
-followed by `ATTEMPTED`, `🏁 wave 1/2 — FAILED`, and the summary digest.
+Expected in Grok Bot: `🔁 wave-1-fixer failed review - fix round 1` and
+`... fix round 2`, then `wave-1-fixer - ❌ failed after 3 rounds · wave 1`
+followed by `ATTEMPTED`, `🏁 wave 1/2 - FAILED`, and the summary digest.
 **No** push mentions `wave-2-never-runs` - if one does, stop-on-failure
 regressed.
 
@@ -323,6 +328,49 @@ prompts: `examples/grok-bot-prompts.md`.
 
 Per-role routing (1 app or 1 chat per role, `PI_WAVE_CHAT_ROLE_URL`) is in
 `examples/pi-prompts.md` sections 4-5, and costs a full role-split run.
+
+## Level 7 - full e2e build: a NASA-themed website
+
+The whole chain on a real deliverable, from a fixed plan
+(`tests/plans/nasa-site-herdr.json`) so every run tests the same shape:
+design → three parallel builders sharing one contract, each gated by a
+`review_cmd` → a visual + code QA that screenshots the page with headless
+Chrome and looks at the images. Real cost (one `gpt-5.5` high, three `k3`
+high plus any fix rounds, one `claude-sonnet-5`) - run deliberately.
+
+The QA agent runs `kind: "omp"`, which needs Herdr, so start pi in a Herdr
+pane from an empty project directory (the plan's `cwd` is `.`):
+
+```bash
+mkdir -p ~/labs/nasa-site && cd ~/labs/nasa-site && pi
+```
+
+Then paste:
+
+> เรียกใช้ tool dispatch_wave ด้วย plan ที่ ~/labs/pi-wave/tests/plans/nasa-site-herdr.json แล้วรอจนได้ summary จริง ห้ามทำ assignment เอง ห้ามแก้ไฟล์ plan จากนั้นสรุปให้ผม: (1) สถานะและจำนวน rounds ของทั้ง 5 agent (2) มี fix round ที่ไหนและเพราะอะไร (3) มี prompt_stall_recovery หรือ prompt_stall_pane_check ของ qa กี่ครั้ง (4) รายการปัญหาที่ qa เจอจากภาพ screenshot และจากโค้ด ยกมาตามที่ qa เขียน
+
+Expected:
+
+- 3 waves in order; `html`, `css` and `js` open side by side in one row.
+  All 5 agents `status: "pass"`, overall `status: "completed"`. A
+  `review_failed` on a builder is fine as long as its fix round passes.
+- `qa` typically logs one `prompt_stall_recovery` then one
+  `prompt_stall_pane_check` while the OMP CLI boots, and still ends `pass`.
+  `blocked` must mean a real approval dialog is open in its pane (e.g.
+  permission to run Chrome): approve it there and rerun; a stall must never
+  show up as `blocked`.
+- `~/labs/nasa-site` holds `index.html`, `styles.css`, `app.js` and
+  `qa/desktop.png`, `qa/mobile.png`, nothing else.
+- The summary's `text` for each agent is that agent's answer only (the
+  design spec, the builders' summaries, the QA issue list), not pane
+  scrollback with pi's banner or earlier prompts. `qa` is the exception: OMP
+  keeps no pi session, so its text is still read from the pane.
+- Check the QA yourself: `open ~/labs/nasa-site/qa/mobile.png` - clipped or
+  overflowing Thai text at 375px is the classic miss, and qa must have
+  reported anything you can see there. Then `open index.html`: starfield,
+  timeline, 8 planet cards, stats counting up on scroll, the menu button
+  working at 375px, a footer saying it is an unofficial fan page, no NASA
+  logo, no console errors, no network requests beyond the local files.
 
 ## Cost notes
 
