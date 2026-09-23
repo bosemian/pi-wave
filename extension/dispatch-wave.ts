@@ -29,7 +29,10 @@ export default function (pi: ExtensionAPI) {
       "Self-contained - no skill needed. Use it when a task decomposes into " +
       "independent chunks that can run in parallel; prefer it over doing the work " +
       "yourself or typing herdr commands. " +
-      "YOU build the plan (inline object or a JSON file path). Schema: " +
+      "YOU build the plan (inline object or a JSON file path). When the user gives you a " +
+      "plan file, pass its path as `plan` unchanged - do not read it and re-send it " +
+      "inline, and never change its cwd, orchestrator, models or assignments; a plan's " +
+      "`cwd: \".\"` means the directory this session runs in. Schema: " +
       '{ name, cwd: "/abs/project/dir" (omitted or "." = the directory this session runs in - agents work there), on_failure: "stop"|"continue", display: "auto"(herdr panes inside Herdr, headless otherwise)|"herdr"|"headless", orchestrator: true|{model,thinking,synthesis_model,synthesis_thinking} (spawns a wider orchestrator pane, default openai-codex/gpt-5.5 at high, which reviews agents that have no review_cmd against their done_when and writes the final synthesis; set synthesis_model/synthesis_thinking to hand ONLY the synthesis to a dedicated synthesizer pane), waves: [[assignment, ...], ...] }. ' +
       "Each wave runs its assignments in parallel; later waves only start after the " +
       "previous one passes. Assignment fields: name (unique plan-wide, ^[a-z][a-z0-9_-]{0,31}$, " +

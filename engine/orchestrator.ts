@@ -94,7 +94,13 @@ export const SYNTH_ROLE_SYSTEM_PROMPT =
   "writing the final summary text when asked. Never edit, create, or run code; " +
   "never implement assignments.";
 
-export const MAX_INJECTED_RESULT_CHARS = 6000;
+/** How much of one agent's report the orchestrator's review and later
+ * waves' prompts receive: whole reports in practice (a full design spec
+ * runs 15K chars), capped only so a runaway report cannot fill a context
+ * window. The synthesis takes a shorter excerpt per agent, since it reads
+ * every agent at once. */
+export const MAX_RESULT_CHARS = 100_000;
+export const MAX_SYNTH_RESULT_CHARS = 6000;
 export const ORCH_INTERACT_TIMEOUT = 300;
 export const MAX_HERDR_AGENTS_PER_WAVE = 4;
 export const STALL_WATCH_S = 10; // pi agents boot fast; a stall usually means lost input
@@ -185,6 +191,17 @@ export function parseVerdict(reply: string): [boolean, string] {
   return [false, `orchestrator reply had no VERDICT line:\n${reply.slice(-500)}`];
 }
 
+/** Cap a report, saying where it was cut and why - a reader that cannot
+ * tell must not mistake the engine's cut for an unfinished report. */
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return (
+    text.slice(0, max) +
+    `\n\n[... cut by the engine at ${max} of ${text.length} chars; the agent's report ` +
+    `continues past this point - do not fail it for ending here]`
+  );
+}
+
 const doneWhen = (a: Assignment) => a.done_when || "as stated in the assignment";
 
 function filesLabel(a: Assignment): string {
@@ -195,7 +212,7 @@ export function buildPrompt(a: Assignment, results: Map<string, AgentResult>): s
   let prompt = promptTemplate(a.name, filesLabel(a), doneWhen(a), a.prompt);
   for (const n of a.needs_results) {
     const r = results.get(n);
-    if (r) prompt += `\n\nRESULTS FROM PRIOR WAVES - agent '${n}':\n` + r.text.slice(0, MAX_INJECTED_RESULT_CHARS);
+    if (r) prompt += `\n\nRESULTS FROM PRIOR WAVES - agent '${n}':\n` + clip(r.text, MAX_RESULT_CHARS);
   }
   return prompt;
 }
@@ -272,7 +289,7 @@ export class OrchestratorPane {
     const reply = await this.lock.run(() =>
       this.ask(
         "orchestrator",
-        orchReviewTemplate(a.name, doneWhen(a), a.prompt, text.slice(0, MAX_INJECTED_RESULT_CHARS)),
+        orchReviewTemplate(a.name, doneWhen(a), a.prompt, clip(text, MAX_RESULT_CHARS)),
       ),
     );
     return parseVerdict(reply);
@@ -283,7 +300,7 @@ export class OrchestratorPane {
       .map(
         (r) =>
           `- ${r.name} (${r.model}): status=${r.status}, rounds=${r.rounds}\n` +
-          r.text.slice(0, MAX_INJECTED_RESULT_CHARS),
+          clip(r.text, MAX_SYNTH_RESULT_CHARS),
       )
       .join("\n\n");
     const prompt = orchSynthTemplate(outcomes);

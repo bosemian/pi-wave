@@ -15,6 +15,7 @@ import {
   SYNTH_ROLE_SYSTEM_PROMPT,
   type SessionLike,
   orchestrate,
+  buildPrompt,
   parseVerdict,
   runAssignmentHerdr,
   runAssignmentRpc,
@@ -44,12 +45,15 @@ const spec = (over: Partial<OrchestratorSpec> = {}): OrchestratorSpec => ({
 /** Records startAgent calls; enough of HerdrBackend for OrchestratorPane. */
 class RecordingBackend {
   started: Json[] = [];
+  prompts: string[] = [];
   async startAgent(name: string, _pane: string, model: string, _provider: string | null, thinking: string,
     { systemPrompt = "" }: { systemPrompt?: string } = {}) {
     this.started.push({ name, model, thinking, systemPrompt });
     return ["pi", "--model", model, "--thinking", thinking];
   }
-  async prompt() {}
+  async prompt(_name: string, text: string) {
+    this.prompts.push(text);
+  }
   async checkpoint() {
     return { scrollback: "", replies: 0 };
   }
@@ -438,5 +442,37 @@ describe("model preflight", () => {
       orchestrate(plan, () => {}, fakeDeps({ listModels, rpcSession: () => fakeSession("x") as unknown as SessionLike }));
     assert.equal((await run(known)).status, "completed");
     assert.equal((await run(async () => null)).status, "completed");
+  });
+});
+
+describe("long agent reports", () => {
+  // seen live: a 14,804-char design spec reached the orchestrator cut to
+  // 6,000 chars with no sign it was cut, so it failed review three times for
+  // being "truncated" - a defect the agent could never fix
+  const longSpec = "# Shared spec\n" + "- item\n".repeat(2400) + "## Responsive rules down to 375px"; // ~16.8K chars
+  const plan = () => writePlan({ waves: [[{ name: "design", prompt: "p", model: "kimi-coding/k3" }], [{ name: "html", prompt: "p", model: "kimi-coding/k3", needs_results: ["design"] }]] });
+  const result = (text: string) => ({ name: "design", wave: 1, model: "m", status: "pass" as const, rounds: 1, text, feedback: "", error: "", stats: {}, display: "headless" as const, pane: "" });
+
+  it("reviews the whole report", async () => {
+    const backend = new RecordingBackend();
+    const orch = new OrchestratorPane(backend as unknown as HerdrLike, spec(), fakeLayout(["p"]));
+    await orch.review(plan().waves[0]![0]!, longSpec);
+    assert.ok(backend.prompts[0]!.includes("## Responsive rules down to 375px"));
+  });
+
+  it("hands the whole report to later waves", () => {
+    const p = plan();
+    const prompt = buildPrompt(p.waves[1]![0]!, new Map([["design", result(longSpec)]]));
+    assert.ok(prompt.includes("## Responsive rules down to 375px"));
+  });
+
+  it("says so when a report is too long to pass on whole", async () => {
+    const huge = "x".repeat(250_000);
+    const backend = new RecordingBackend();
+    const orch = new OrchestratorPane(backend as unknown as HerdrLike, spec(), fakeLayout(["p"]));
+    await orch.review(plan().waves[0]![0]!, huge);
+    assert.match(backend.prompts[0]!, /cut by the engine .* 250000 chars.* do not fail/s);
+    const prompt = buildPrompt(plan().waves[1]![0]!, new Map([["design", result(huge)]]));
+    assert.match(prompt, /cut by the engine .* 250000 chars/s);
   });
 });
