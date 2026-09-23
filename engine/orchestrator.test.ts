@@ -16,6 +16,7 @@ import {
   type SessionLike,
   orchestrate,
   buildPrompt,
+  parseSync,
   parseVerdict,
   runAssignmentHerdr,
   runAssignmentRpc,
@@ -319,6 +320,20 @@ describe("headless assignment", () => {
     assert.ok(sess.closed);
   });
 
+  it("tells the agent which command failed when the review is silent", async () => {
+    const plan = writePlan({
+      waves: [[{ name: "quiet", prompt: "p", model: "kimi-coding/k3", files: ["a.txt"], review_cmd: "test -f a.txt", max_fix_rounds: 1 }]],
+    });
+    const sess = fakeSession("tried");
+    const events: Json[] = [];
+    await runAssignmentRpc(plan.waves[0]![0]!, 0, plan, new Map(), (e) => events.push(e),
+      fakeDeps({ rpcSession: () => sess as unknown as SessionLike }));
+    const note = "review_cmd `test -f a.txt` exited 1 without printing anything";
+    assert.ok(sess.prompts[1]!.startsWith("FIX ROUND 1/1"));
+    assert.ok(sess.prompts[1]!.includes(`REVIEW FEEDBACK:\n${note}`));
+    assert.equal(events.find((e) => e.type === "review_failed")!.review_output_tail, note);
+  });
+
   it("refuses kind=omp without a pane", async () => {
     const plan = writePlan({
       waves: [[{ name: "qa", prompt: "p", model: "claude-sonnet-5", kind: "omp", display: "headless" }]],
@@ -391,6 +406,18 @@ describe("runReview", () => {
   it("exposes the agent name to the command", async () => {
     const [, out] = await runReview("echo $PI_WAVE_AGENT", os.tmpdir(), "wave-1-code");
     assert.equal(out.trim(), "wave-1-code");
+  });
+
+  it("names the command and exit code when a failing review prints nothing", async () => {
+    const [ok, out] = await runReview("grep -q nope /dev/null", os.tmpdir(), "a");
+    assert.equal(ok, false);
+    assert.equal(out, "review_cmd `grep -q nope /dev/null` exited 1 without printing anything");
+  });
+
+  it("keeps a failing review's output and ends it with the command and exit code", async () => {
+    const [ok, out] = await runReview("echo missing footer; exit 3", os.tmpdir(), "a");
+    assert.equal(ok, false);
+    assert.equal(out, "missing footer\nreview_cmd `echo missing footer; exit 3` exited 3");
   });
 
   it("stops a long review when the run is aborted", async () => {
@@ -474,5 +501,145 @@ describe("long agent reports", () => {
     assert.match(backend.prompts[0]!, /cut by the engine .* 250000 chars.* do not fail/s);
     const prompt = buildPrompt(plan().waves[1]![0]!, new Map([["design", result(huge)]]));
     assert.match(prompt, /cut by the engine .* 250000 chars/s);
+  });
+});
+
+describe("parseSync", () => {
+  it("passes on SYNC: pass", () => {
+    assert.equal(parseSync("checked everything\nSYNC: PASS").ok, true);
+  });
+
+  it("splits a fail into per-agent issues and an unaddressed note", () => {
+    const v = parseSync("SYNC: fail\noverall the contract drifted\nAGENT css:\n- use #hero\nAGENT js: - read data-count\n- guard null");
+    assert.equal(v.ok, false);
+    assert.deepEqual([...v.fixes], [["css", "- use #hero"], ["js", "- read data-count\n- guard null"]]);
+    assert.equal(v.note, "overall the contract drifted");
+  });
+
+  it("fails without a SYNC line", () => {
+    const v = parseSync("looks good");
+    assert.equal(v.ok, false);
+    assert.ok(v.note.includes("no SYNC line"));
+  });
+});
+
+/** HerdrLike whose agents answer from per-agent scripts (default: a short
+ * done message) and which records every prompt it is sent. */
+class ScriptedHerdr implements HerdrLike {
+  prompts: { name: string; text: string }[] = [];
+  private panes = 0;
+  private readonly scripts: Record<string, string[]>;
+  constructor(scripts: Record<string, string[]> = {}) {
+    this.scripts = scripts;
+  }
+  async splitPane() {
+    return `w1:p${++this.panes}`;
+  }
+  async startAgent(_n: string, _p: string, model: string) {
+    return ["pi", "--model", model];
+  }
+  async prompt(name: string, text: string) {
+    this.prompts.push({ name, text });
+  }
+  async checkpoint() {
+    return { scrollback: "", replies: 0 };
+  }
+  async reply(name: string) {
+    return this.scripts[name]?.shift() ?? `${name} done`;
+  }
+  async waitLateStart() {
+    return null;
+  }
+  async waitSettled() {}
+  async waitPaneSettled() {
+    return true;
+  }
+  sentTo(name: string) {
+    return this.prompts.filter((p) => p.name === name).map((p) => p.text);
+  }
+}
+
+describe("wave sync", () => {
+  const builder = (name: string, over: Json = {}) => ({
+    name, prompt: "p", model: "kimi-coding/k3", files: [`${name}.txt`], display: "herdr", review_cmd: "true", ...over,
+  });
+  const run = async (plan: ReturnType<typeof writePlan>, herdr: ScriptedHerdr, over: Partial<Deps> = {}) => {
+    const events: Json[] = [];
+    const summary = await orchestrate(plan, (e) => events.push(e), fakeDeps({ herdrBackend: () => herdr, ...over }));
+    return { events, summary };
+  };
+
+  it("cross-checks a parallel wave and sends each fix to the agent that owns it", async () => {
+    const plan = writePlan({ orchestrator: true, waves: [[builder("html"), builder("css")]] });
+    const herdr = new ScriptedHerdr({ orchestrator: ["SYNC: fail\nAGENT css:\n- style #hero, not .hero", "SYNC: pass"] });
+    const { events, summary } = await run(plan, herdr);
+    assert.equal(herdr.sentTo("html").length, 1); // no fix for html
+    const cssFix = herdr.sentTo("css")[1]!;
+    assert.ok(cssFix.startsWith("SYNC FIX 1/2") && cssFix.includes("style #hero, not .hero"));
+    assert.ok(herdr.sentTo("orchestrator")[1]!.includes("css replied:")); // the recheck sees the fix
+    assert.deepEqual(summary.waves[0].sync, { status: "pass", rounds: 1 });
+    assert.equal(summary.status, "completed");
+    assert.equal(count(events, "sync_fix"), 1);
+  });
+
+  it("routes a later wave's findings back to an earlier wave's agent", async () => {
+    const plan = writePlan({
+      orchestrator: true,
+      waves: [[builder("css")], [{ name: "qa", prompt: "p", model: "kimi-coding/k3", files: [], display: "herdr" }]],
+    });
+    const herdr = new ScriptedHerdr({
+      qa: ["mobile.png: hero text overflows at 375px (css.txt line 12)"],
+      orchestrator: ["VERDICT: pass", "SYNC: fail\nAGENT css:\n- wrap hero text at 375px", "SYNC: pass"],
+    });
+    const { events, summary } = await run(plan, herdr);
+    assert.equal(count(events, "sync_start"), 2); // the lone first wave is not synced
+    assert.ok(herdr.sentTo("orchestrator")[1]!.includes("hero text overflows")); // qa's report is in the check
+    assert.ok(herdr.sentTo("css")[1]!.includes("wrap hero text at 375px"));
+    assert.equal(summary.waves[1].sync.status, "pass");
+    assert.equal(summary.status, "completed");
+  });
+
+  it("fails the owners and stops once the fix rounds run out", async () => {
+    const plan = writePlan({ orchestrator: true, waves: [[builder("html"), builder("css")], [builder("never")]] });
+    const herdr = new ScriptedHerdr({ orchestrator: Array(3).fill("SYNC: fail\nAGENT css:\n- still wrong") });
+    const { summary } = await run(plan, herdr);
+    assert.equal(herdr.sentTo("css").length, 1 + 2); // the task, then MAX_SYNC_ROUNDS fixes
+    const css = summary.waves[0].agents.find((a: Json) => a.name === "css");
+    assert.equal(css.status, "fail");
+    assert.equal(css.feedback, "- still wrong");
+    assert.deepEqual(summary.waves[0].sync, { status: "fail", rounds: 2, issues: "css:\n- still wrong" });
+    assert.equal(summary.status, "stopped");
+    assert.equal(summary.waves[1].agents.length, 0);
+  });
+
+  it("tells the orchestrator when a fix broke the owner's review_cmd", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "pi-wave-sync-"));
+    const counter = path.join(dir, "runs");
+    // passes on its first run (the task), fails on the second (after the fix)
+    const flaky = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; echo broke-at-$n; [ $n -lt 1 ]`;
+    const plan = writePlan({ orchestrator: true, waves: [[builder("html"), builder("css", { review_cmd: flaky })]] });
+    const herdr = new ScriptedHerdr({ orchestrator: ["SYNC: fail\nAGENT css:\n- x", "SYNC: pass"] });
+    await run(plan, herdr);
+    assert.match(herdr.sentTo("orchestrator")[1]!, /its review_cmd now fails:\s*broke-at-1/);
+  });
+
+  it("leaves issues open for an agent with no pane to fix in", async () => {
+    const plan = writePlan({
+      orchestrator: true,
+      waves: [[builder("data", { display: "headless" })], [builder("qa")]],
+    });
+    const herdr = new ScriptedHerdr({ orchestrator: ["SYNC: fail\nAGENT data:\n- bad field"] });
+    const { summary } = await run(plan, herdr, { rpcSession: () => fakeSession("rows") as unknown as SessionLike });
+    // one check, no pointless recheck (the other orchestrator prompt is the synthesis)
+    assert.equal(herdr.sentTo("orchestrator").filter((t) => t.includes("syncing wave")).length, 1);
+    assert.equal(summary.waves[0].agents[0].status, "fail");
+    assert.equal(summary.waves[1].sync.status, "fail");
+  });
+
+  it("skips the sync without an orchestrator", async () => {
+    const plan = writePlan({ waves: [[builder("html"), builder("css")]] });
+    const { events, summary } = await run(plan, new ScriptedHerdr());
+    assert.equal(count(events, "sync_start"), 0);
+    assert.equal(summary.waves[0].sync, undefined);
   });
 });

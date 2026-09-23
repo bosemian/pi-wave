@@ -76,6 +76,40 @@ const orchSynthTemplate = (outcomes: string) =>
 PER-AGENT OUTCOMES:
 ${outcomes}`;
 
+const orchSyncTemplate = (wave: number, reports: string, owners: string, fixes: string) =>
+  `You are the wave orchestrator syncing wave ${wave}. Every agent in it passed its own ` +
+  `check; your job is to make the agents' results fit together. Review only - never edit ` +
+  `files yourself; you may read files in the project to verify.
+
+THIS WAVE'S AGENTS:
+${reports}
+
+ALL AGENTS SO FAR (route each issue to the agent that owns the file that must change):
+${owners}
+${fixes ? `\nFIXES SINCE YOUR LAST CHECK:\n${fixes}\n` : ""}
+Check (1) that this wave's results agree with each other and with earlier waves' ` +
+  `contracts - shared names, ids and classes, interfaces, data formats - and (2) that every ` +
+  `problem this wave's agents report about files (e.g. a QA agent's findings) is real and still ` +
+  `open; verify it by reading the file. Ignore style preferences and never ask for new features.
+
+Reply in EXACTLY this format:
+Line 1: SYNC: pass
+or:    SYNC: fail
+If fail, then one block per agent that must change something:
+AGENT <name>:
+- <specific fix, with file and line when you can>
+Only name agents from ALL AGENTS SO FAR, and only for work they own.`;
+
+const syncFixTemplate = (round: number, max: number, files: string, issues: string) =>
+  `SYNC FIX ${round}/${max} from the wave orchestrator: a cross-check of the agents' results ` +
+  `found issues in your work that other agents depend on. Address ALL of them in one pass, ` +
+  `touching only your files, then end with a concise summary of what you changed.
+
+FILES YOU MAY TOUCH: ${files}
+
+ISSUES:
+${issues}`;
+
 // Role constraints pinned into the panes' system prompts (via
 // --append-system-prompt, see HerdrBackend.startAgent): the orchestrator
 // only reviews and synthesizes - it never implements assignments itself.
@@ -106,6 +140,8 @@ export const MAX_HERDR_AGENTS_PER_WAVE = 4;
 export const STALL_WATCH_S = 10; // pi agents boot fast; a stall usually means lost input
 export const STALL_WATCH_S_OMP = 60; // the OMP CLI can take 30-90s to first respond
 export const MAX_PROMPT_ATTEMPTS = 2;
+/** Cross-agent fix rounds per wave before its remaining issues fail it. */
+export const MAX_SYNC_ROUNDS = 2;
 
 /** The parts of HerdrBackend the engine drives (tests pass fakes). */
 export type HerdrLike = Pick<
@@ -202,6 +238,47 @@ function clip(text: string, max: number): string {
   );
 }
 
+export interface SyncVerdict {
+  ok: boolean;
+  /** Issues to fix, by the agent that owns them. */
+  fixes: Map<string, string>;
+  /** Feedback not addressed to any agent. */
+  note: string;
+}
+
+/** First 'SYNC: pass|fail' line decides; after a fail, each 'AGENT <name>:'
+ * line opens that agent's block of issues. */
+export function parseSync(reply: string): SyncVerdict {
+  const lines = reply.trim().split(/\r?\n/);
+  const at = lines.findIndex((l) => l.trim().toLowerCase().startsWith("sync:"));
+  if (at === -1) {
+    return { ok: false, fixes: new Map(), note: `orchestrator reply had no SYNC line:\n${reply.slice(-500)}` };
+  }
+  if (lines[at]!.trim().slice("sync:".length).trim().toLowerCase().startsWith("pass")) {
+    return { ok: true, fixes: new Map(), note: "" };
+  }
+  const fixes = new Map<string, string[]>();
+  const note: string[] = [];
+  let current: string[] = note;
+  for (const line of lines.slice(at + 1)) {
+    const head = /^\s*agent\s+([a-z][a-z0-9_-]*)\s*:\s*(.*)$/i.exec(line);
+    if (head) {
+      current = fixes.get(head[1]!) ?? [];
+      fixes.set(head[1]!, current);
+      if (head[2]) current.push(head[2]);
+    } else {
+      current.push(line);
+    }
+  }
+  const joined = new Map([...fixes].map(([name, l]) => [name, l.join("\n").trim()] as const));
+  const noteText = note.join("\n").trim();
+  return {
+    ok: false,
+    fixes: joined,
+    note: noteText || (joined.size ? "" : "orchestrator gave no specific feedback"),
+  };
+}
+
 const doneWhen = (a: Assignment) => a.done_when || "as stated in the assignment";
 
 function filesLabel(a: Assignment): string {
@@ -220,7 +297,8 @@ export function buildPrompt(a: Assignment, results: Map<string, AgentResult>): s
 const fixPrompt = (a: Assignment, round: number, feedback: string) =>
   fixTemplate(round, a.max_fix_rounds, filesLabel(a), doneWhen(a), a.prompt, feedback);
 
-/** Run the review command in a shell → [passed, combined stdout+stderr].
+/** Run the review command in a shell → [passed, combined stdout+stderr,
+ * ending with the command and exit code when it fails].
  * Aborting `signal` kills it and counts as a failed review. */
 export function runReview(
   reviewCmd: string,
@@ -248,9 +326,13 @@ export function runReview(
       clearTimeout(timer);
       resolve([false, `review command failed to run: ${e.message}`]);
     });
-    proc.on("close", (code) => {
+    proc.on("close", (code, sig) => {
       clearTimeout(timer);
-      resolve([code === 0, out]);
+      if (code === 0) return resolve([true, out]);
+      // name the command last so silent checks (grep -q, test) still tell
+      // the agent what failed, and the event's output tail keeps it
+      const note = `review_cmd \`${reviewCmd}\` ${code === null ? `was killed by ${sig}` : `exited ${code}`}`;
+      resolve([false, out.trim() ? `${out.trimEnd()}\n${note}` : `${note} without printing anything`]);
     });
   });
 }
@@ -293,6 +375,12 @@ export class OrchestratorPane {
       ),
     );
     return parseVerdict(reply);
+  }
+
+  /** Cross-check a finished wave; see orchSyncTemplate. */
+  async sync(wave: number, reports: string, owners: string, fixes: string): Promise<SyncVerdict> {
+    const reply = await this.lock.run(() => this.ask("orchestrator", orchSyncTemplate(wave, reports, owners, fixes)));
+    return parseSync(reply);
   }
 
   synthesize(results: Map<string, AgentResult>): Promise<string> {
@@ -548,6 +636,95 @@ export async function runAssignmentRpc(
   return res;
 }
 
+export interface SyncOutcome {
+  status: "pass" | "fail";
+  rounds: number;
+  issues?: string;
+}
+
+/** After a wave passes its own checks, have the orchestrator cross-check
+ * it and route what it finds to the agents that own the work - in this wave
+ * or an earlier one, whose panes stay open - as fix prompts, up to
+ * MAX_SYNC_ROUNDS times. Agents still flagged after that fail. Agents
+ * without a live pane (headless, or never started) cannot take a fix, so
+ * their issues stay open. Mutates `results`. */
+export async function syncWave(
+  wIdx: number,
+  plan: Plan,
+  results: Map<string, AgentResult>,
+  orch: OrchestratorPane,
+  herdr: HerdrLike,
+  emit: Emitter,
+  deps: Deps,
+): Promise<SyncOutcome> {
+  const wave = plan.waves[wIdx]!;
+  const assignments = new Map(plan.waves.flat().map((a) => [a.name, a]));
+  const reports = wave
+    .map((a) => `### ${a.name} (files: ${filesLabel(a)})\nDEFINITION OF DONE: ${doneWhen(a)}\nREPORT:\n` +
+      clip(results.get(a.name)?.text ?? "", MAX_RESULT_CHARS))
+    .join("\n\n");
+  const owners = [...results.values()]
+    .map((r) => `- ${r.name} (wave ${r.wave}, files: ${filesLabel(assignments.get(r.name)!)}, status ${r.status})`)
+    .join("\n");
+  let fixes = "";
+  for (let round = 1; ; round++) {
+    deps.signal?.throwIfAborted();
+    emit({ type: "sync_start", wave: wIdx + 1, round });
+    const verdict = await orch.sync(wIdx + 1, reports, owners, fixes);
+    if (verdict.ok) {
+      emit({ type: "sync_done", wave: wIdx + 1, status: "pass", rounds: round - 1 });
+      return { status: "pass", rounds: round - 1 };
+    }
+    const fixable = [...verdict.fixes].filter(([name]) => {
+      const r = results.get(name);
+      return r?.display === "herdr" && r.pane !== "";
+    });
+    const open = [
+      ...(verdict.note ? [verdict.note] : []),
+      ...[...verdict.fixes].filter(([name]) => !fixable.some(([n]) => n === name))
+        .map(([name, items]) => `${name} (no pane to send a fix to):\n${items}`),
+    ];
+    if (round > MAX_SYNC_ROUNDS || fixable.length === 0) {
+      for (const [name, items] of verdict.fixes) {
+        const r = results.get(name);
+        if (r) Object.assign(r, { status: "fail", feedback: items });
+      }
+      const issues = [...[...verdict.fixes].map(([name, items]) => `${name}:\n${items}`), ...(verdict.note ? [verdict.note] : [])]
+        .join("\n\n");
+      emit({ type: "sync_done", wave: wIdx + 1, status: "fail", rounds: round - 1, issues_tail: issues.slice(-500) });
+      return { status: "fail", rounds: round - 1, issues };
+    }
+
+    const fixOne = async ([name, items]: [string, string]) => {
+      const a = assignments.get(name)!;
+      const r = results.get(name)!;
+      emit({ type: "sync_fix", wave: wIdx + 1, round, agent: name, issues_tail: items.slice(-500) });
+      try {
+        const since = await herdr.checkpoint(name);
+        await promptHerdr(herdr, a, syncFixTemplate(round, MAX_SYNC_ROUNDS, filesLabel(a), items), since, emit, deps);
+        const reply = await herdr.reply(name, since);
+        r.text += `\n\nSYNC FIX ${round}:\n${reply}`;
+        r.rounds += 1;
+        let check = "";
+        if (a.review_cmd) {
+          const [ok, out] = await runReview(a.review_cmd, plan.cwd, a.name, deps.signal);
+          if (!ok) check = `\nits review_cmd now fails:\n${out.slice(-1500)}`;
+        }
+        return `${name} replied:\n${clip(reply, MAX_SYNTH_RESULT_CHARS)}${check}`;
+      } catch (e) {
+        return `${name} could not take the fix (${errMsg(e)})`;
+      }
+    };
+    // owners from different waves may share a file; only disjoint ones fix at once
+    const files = fixable.flatMap(([name]) => assignments.get(name)!.files);
+    const replies =
+      new Set(files).size === files.length
+        ? await Promise.all(fixable.map(fixOne))
+        : await fixable.reduce<Promise<string[]>>(async (acc, f) => [...(await acc), await fixOne(f)], Promise.resolve([]));
+    fixes = [...replies, ...open.map((o) => `still open: ${o}`)].join("\n\n");
+  }
+}
+
 /** pi models the plan names that pi cannot run (a typo, or a provider
  * without auth), as "model (who)". pi accepts any id at start-up and only
  * fails on the first prompt, so this is checked before anything spawns.
@@ -576,7 +753,14 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
     agents: plan.waves.reduce((n, w) => n + w.length, 0),
   });
 
+  // One Herdr backend for the whole run: it holds each pane agent's session
+  // file, which a sync fix to an earlier wave's agent needs.
+  let herdr: HerdrLike | null = null;
+  const makeHerdr = deps.herdrBackend;
+  deps = { ...deps, herdrBackend: (cwd, signal) => (herdr ??= makeHerdr(cwd, signal)) };
+
   const results = new Map<string, AgentResult>();
+  const syncs = new Map<number, SyncOutcome>();
   let overall = "completed";
   // why the run stopped early; it also goes into the summary, which is all
   // a tool caller gets back (the stopped event only streams as an update)
@@ -640,7 +824,13 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
       wave.map((a) => runAssignment(a, wIdx, plan, results, emit, orch, layout, deps)),
     );
     for (const r of outcomes) results.set(r.name, r);
-    const waveOk = outcomes.every((r) => r.status === "pass");
+    let waveOk = outcomes.every((r) => r.status === "pass");
+    // a lone first wave has nothing to agree with yet
+    if (orch && waveOk && (wave.length > 1 || wIdx > 0)) {
+      const sync = await syncWave(wIdx, plan, results, orch, deps.herdrBackend(plan.cwd, deps.signal), emit, deps);
+      syncs.set(wIdx, sync);
+      waveOk = sync.status === "pass";
+    }
     emit({ type: "wave_done", wave: wIdx + 1, passed: waveOk });
     if (!waveOk && plan.on_failure === "stop") {
       stop("wave failed and plan.on_failure is 'stop'; later waves were not dispatched");
@@ -656,6 +846,7 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
     ...(stopReason ? { reason: stopReason } : {}),
     waves: plan.waves.map((wave, i) => ({
       wave: i + 1,
+      ...(syncs.has(i) ? { sync: syncs.get(i) } : {}),
       agents: wave.flatMap((a) => {
         const r = results.get(a.name);
         return r ? [resultJson(r)] : [];

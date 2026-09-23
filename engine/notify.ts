@@ -431,6 +431,12 @@ export class Notifier {
       this.log.push(`wave ${event.wave} ` + (ok ? "passed" : "FAILED"));
       this.notify(`wave ${event.wave}`, ok ? "✅ all agents passed" : "❌ wave failed - see dashboard", !ok);
       this.push("wave_done", `🏁 wave ${event.wave}/${this.plan.waves.length} - ` + (ok ? "all passed" : "FAILED"));
+    } else if (etype === "sync_start") {
+      this.log.push(`wave ${event.wave} sync check ${event.round}`);
+    } else if (etype === "sync_fix") {
+      this.log.push(`wave ${event.wave} sync: fix sent to ${event.agent}`);
+    } else if (etype === "sync_done") {
+      this.log.push(`wave ${event.wave} sync ${event.status === "pass" ? "passed" : "FAILED"} after ${event.rounds} fix round(s)`);
     } else if (etype === "stopped") {
       this.log.push(`stopped: ${event.reason}`);
     } else if (etype === "orchestrator_start") {

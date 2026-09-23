@@ -335,14 +335,20 @@ The whole chain on a real deliverable, from a fixed plan
 (`tests/plans/nasa-site-herdr.json`) so every run tests the same shape:
 design → three parallel builders sharing one contract, each gated by a
 `review_cmd` → a visual + code QA that screenshots the page with headless
-Chrome and looks at the images. Real cost (one `gpt-5.5` high, three `k3`
-high plus any fix rounds, one `claude-sonnet-5`) - run deliberately.
+Chrome and looks at the images. The orchestrator reviews `design` and `qa`,
+syncs waves 2 and 3 (cross-checks the builders against each other, and
+routes QA's findings back to the builder that owns each file), and writes
+the synthesis. Real cost (`gpt-5.5` high for design, reviews, sync checks
+and synthesis, three `k3` high plus any fix rounds, one `claude-sonnet-5`) -
+run deliberately.
 
 The QA agent runs `kind: "omp"`, which needs Herdr, so start pi in a Herdr
-pane from an empty project directory (the plan's `cwd` is `.`):
+pane from an empty project directory (the plan's `cwd` is `.`). Always
+start from an EMPTY directory - files left from an earlier run mislead the
+builders and the checks:
 
 ```bash
-mkdir -p ~/labs/nasa-site && cd ~/labs/nasa-site && pi
+rm -rf ~/labs/nasa-site && mkdir -p ~/labs/nasa-site && cd ~/labs/nasa-site && pi
 ```
 
 Then paste:
@@ -353,12 +359,19 @@ Expected:
 
 - 3 waves in order; `html`, `css` and `js` open side by side in one row.
   All 5 agents `status: "pass"`, overall `status: "completed"`. A
-  `review_failed` on a builder is fine as long as its fix round passes.
+  `review_failed` on a builder is fine as long as its fix round passes;
+  its `review_output_tail` names the check that failed and ends with
+  ``review_cmd `...` exited 1``.
 - `qa` typically logs one `prompt_stall_recovery` then one
   `prompt_stall_pane_check` while the OMP CLI boots, and still ends `pass`.
   `blocked` must mean a real approval dialog is open in its pane (e.g.
   permission to run Chrome): approve it there and rerun; a stall must never
   show up as `blocked`.
+- Waves 2 and 3 each log `sync_start` and end `sync_done` with
+  `status: "pass"`; the summary shows `sync` on both. Any `sync_fix` must go
+  to the builder that owns the file (a QA finding about `styles.css` goes to
+  `css`, in wave 2), and that builder's pane shows a `SYNC FIX` prompt. The
+  `synthesis` is plain text, not pane scrollback.
 - `~/labs/nasa-site` holds `index.html`, `styles.css`, `app.js` and
   `qa/desktop.png`, `qa/mobile.png`, nothing else.
 - The summary's `text` for each agent is that agent's answer only (the

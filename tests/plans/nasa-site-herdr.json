@@ -3,6 +3,7 @@
   "cwd": ".",
   "on_failure": "stop",
   "display": "herdr",
+  "orchestrator": true,
   "waves": [
     [
       {
@@ -27,7 +28,7 @@
         "needs_results": [
           "design"
         ],
-        "review_cmd": "test -s index.html && grep -q 'href=\"styles.css\"' index.html && grep -q 'src=\"app.js\"' index.html && grep -qi 'unofficial' index.html",
+        "review_cmd": "test -s index.html || { echo \"index.html is missing or empty\"; exit 1; }; grep -q 'href=\"styles.css\"' index.html || { echo \"index.html does not link styles.css\"; exit 1; }; grep -q 'src=\"app.js\"' index.html || { echo \"index.html does not load app.js\"; exit 1; }; tr -d '\\n' < index.html | sed 's|</footer>.*||' | grep -q '<footer.*NASA' || { echo \"index.html has no <footer> naming NASA (the unofficial fan-page disclaimer)\"; exit 1; }",
         "done_when": "index.html implements every section of the spec with the spec's ids and classes",
         "timeout": 900
       },
@@ -42,7 +43,7 @@
         "needs_results": [
           "design"
         ],
-        "review_cmd": "test -s styles.css && grep -q -- '--' styles.css && grep -q '@media' styles.css",
+        "review_cmd": "test -s styles.css || { echo \"styles.css is missing or empty\"; exit 1; }; grep -q -- '--' styles.css || { echo \"styles.css defines no CSS custom properties\"; exit 1; }; grep -q '@media' styles.css || { echo \"styles.css has no @media rules\"; exit 1; }",
         "done_when": "styles.css styles every id/class in the spec and is responsive down to 375px",
         "timeout": 900
       },
@@ -57,7 +58,7 @@
         "needs_results": [
           "design"
         ],
-        "review_cmd": "node --check app.js",
+        "review_cmd": "test -s app.js || { echo \"app.js is missing or empty\"; exit 1; }; node --check app.js",
         "done_when": "app.js implements every behaviour in the spec using the spec's ids, classes and data attributes",
         "timeout": 900
       }

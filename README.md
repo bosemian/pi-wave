@@ -74,11 +74,23 @@ installed can delegate waves correctly. No skill has to be loaded or edited:
   `review_cmd` against their `done_when` (strict `VERDICT: pass|fail` reply)
   and writes the final `synthesis` in the summary. `review_cmd` still wins
   when present; the name `orchestrator` is reserved.
+  It also keeps the agents in sync: after a wave passes its own checks
+  (skipped for a lone first wave), it cross-checks the wave's results against
+  each other and against earlier waves - shared names, ids/classes,
+  interfaces - and verifies any problems the wave's agents report (e.g. a QA
+  agent's findings) by reading the files. It replies `SYNC: pass`, or
+  `SYNC: fail` with one `AGENT <name>:` block per agent that must change
+  something; the engine sends each block as a fix prompt to that agent's
+  still-open pane (in this wave or an earlier one), reruns its `review_cmd`,
+  and asks again - at most 2 fix rounds. Agents still flagged then fail and
+  the wave fails. Agents without a pane (headless) cannot take a fix, so
+  their issues stay open. The summary records each synced wave as
+  `sync: {status, rounds, issues?}`.
   Set `synthesis_model`/`synthesis_thinking` to hand ONLY the final synthesis
   to a dedicated one-shot `synthesizer` pane (e.g. review on one model,
   synthesis on `gpt-5.6-sol • high`).
-- The `dispatch_wave` tool accepts the plan **inline** (an object, written to
-  a temp file) or as an absolute path — the agent never hand-edits a file.
+- The `dispatch_wave` tool accepts the plan **inline** (an object) or as a
+  path - the agent never hand-edits a file.
 
 ## Progress dashboard & notifications
 
