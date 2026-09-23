@@ -1,0 +1,22 @@
+{
+  "name": "nasa-site-qa-retry",
+  "cwd": ".",
+  "on_failure": "continue",
+  "display": "herdr",
+  "orchestrator": false,
+  "waves": [
+    [
+      {
+        "name": "qa",
+        "prompt": "You are the QA agent for this directory. The implementation is in index.html, styles.css, and app.js. Perform a thorough read-only QA pass now. Inspect the files and run available static checks. If a browser/devtools MCP is available, test the page at desktop and 375px mobile: verify no horizontal overflow, hero/starfield rendering, mobile menu toggle and aria-expanded behavior, nav link closing, stat count-up, responsive grids, and console errors. If browser tooling is unavailable, document that limitation and perform the strongest static verification possible. Do not modify files. Return a concise report with PASS/FAIL findings and exact issues, if any.",
+        "model": "claude-sonnet-5",
+        "kind": "omp",
+        "thinking": "high",
+        "files": [],
+        "done_when": "QA completes with a concrete report covering static checks and, if possible, real-browser behavior; no files modified.",
+        "review_cmd": "for f in index.html styles.css app.js; do test -s \"$f\" || { echo \"$f is missing or empty\"; exit 1; }; done; node --check app.js",
+        "timeout": 900
+      }
+    ]
+  ]
+}
