@@ -2,10 +2,11 @@
 // recovery (no Herdr, no pi). Run from the repo root: npm test
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { AgentTimeoutError } from "./errors.ts";
 import { HerdrBackend, HerdrPromptStalled } from "./herdr.ts";
 import {
   type Deps,
@@ -56,7 +57,7 @@ class RecordingBackend {
     this.prompts.push(text);
   }
   async checkpoint() {
-    return { scrollback: "", replies: 0 };
+    return { scrollback: "", replies: 0, busy: false };
   }
   async reply() {
     return "ok";
@@ -142,18 +143,22 @@ describe("parseVerdict", () => {
  * promptCalls: per-attempt outcome for prompt() - an Error to throw (e.g.
  * HerdrPromptStalled) or null for success; attempts past the list succeed.
  * lateStart: what waitLateStart reports (null = agent never woke → resend
- * path; a status string = late wake). */
+ * path; a status string = late wake). done: what waitDone throws (null =
+ * the agent finished). busy: the agent is mid-turn at every checkpoint. */
 class FakeHerdrBackend implements HerdrLike {
   promptsSent = 0;
+  waitDoneArgs: [number, number] | null = null;
   private readonly promptCalls: (Error | null)[];
   private readonly lateStart: string | null;
-  private readonly paneSettled: boolean;
+  private readonly done: Error | null;
+  private readonly busy: boolean;
 
-  constructor({ promptCalls = [], lateStart = null, paneSettled = false }:
-    { promptCalls?: (Error | null)[]; lateStart?: string | null; paneSettled?: boolean } = {}) {
+  constructor({ promptCalls = [], lateStart = null, done = new AgentTimeoutError("never changed"), busy = false }:
+    { promptCalls?: (Error | null)[]; lateStart?: string | null; done?: Error | null; busy?: boolean } = {}) {
     this.promptCalls = [...promptCalls];
     this.lateStart = lateStart;
-    this.paneSettled = paneSettled;
+    this.done = done;
+    this.busy = busy;
   }
   async splitPane() {
     return "w1:pF";
@@ -167,7 +172,7 @@ class FakeHerdrBackend implements HerdrLike {
     if (outcome) throw outcome;
   }
   async checkpoint() {
-    return { scrollback: "before", replies: 0 };
+    return { scrollback: "before", replies: 0, busy: this.busy };
   }
   async reply() {
     return "all done";
@@ -176,8 +181,9 @@ class FakeHerdrBackend implements HerdrLike {
     return this.lateStart;
   }
   async waitSettled() {}
-  async waitPaneSettled() {
-    return this.paneSettled;
+  async waitDone(_n: string, _s: unknown, timeoutS: number, bootS: number) {
+    this.waitDoneArgs = [timeoutS, bootS];
+    if (this.done) throw this.done;
   }
 }
 
@@ -241,8 +247,8 @@ describe("herdr stall recovery", () => {
     assert.equal(count(events, "prompt_stall_recovery"), 2);
   });
 
-  it("lets the pane-settled fallback save a false timeout", async () => {
-    const fake = new FakeHerdrBackend({ promptCalls: [stalled(), stalled()], lateStart: null, paneSettled: true });
+  it("lets the wait-for-done fallback save a false timeout", async () => {
+    const fake = new FakeHerdrBackend({ promptCalls: [stalled(), stalled()], lateStart: null, done: null });
     const events = await runWith(fake);
     assert.equal(doneOf(events).status, "pass");
     assert.equal(count(events, "prompt_stall_pane_check"), 1);
@@ -252,7 +258,7 @@ describe("herdr stall recovery", () => {
     // kind=omp never reports a non-idle agent_status at all (confirmed
     // live), so a second blind attempt would just re-submit the same prompt
     // to an agent already working or already done.
-    const fake = new FakeHerdrBackend({ promptCalls: [stalled()], lateStart: null, paneSettled: true });
+    const fake = new FakeHerdrBackend({ promptCalls: [stalled()], lateStart: null, done: null });
     const events = await runWith(fake, "omp");
     assert.equal(doneOf(events).status, "pass");
     assert.equal(fake.promptsSent, 1); // no resend
@@ -260,11 +266,28 @@ describe("herdr stall recovery", () => {
     assert.equal(count(events, "prompt_stall_pane_check"), 1);
   });
 
-  it("omp that stays idle times out after one attempt", async () => {
-    const fake = new FakeHerdrBackend({ promptCalls: [stalled()], lateStart: null, paneSettled: false });
+  it("omp that stays idle times out after one attempt, saying why", async () => {
+    const fake = new FakeHerdrBackend({
+      promptCalls: [stalled()], lateStart: null, done: new AgentTimeoutError("[probe] pane never changed"),
+    });
     const events = await runWith(fake, "omp");
     assert.equal(doneOf(events).status, "timeout");
     assert.equal(fake.promptsSent, 1);
+  });
+
+  it("waits for a stalled agent up to its assignment timeout, not the watch window", async () => {
+    // qa was declared stalled after 60s while it was still working
+    const fake = new FakeHerdrBackend({ promptCalls: [stalled()], lateStart: null, done: null });
+    const events = await runWith(fake, "omp");
+    assert.deepEqual(fake.waitDoneArgs, [600, 60]);
+    assert.equal(events.find((e) => e.type === "prompt_stall_pane_check")!.timeout_s, 600);
+  });
+
+  it("never sends a prompt to an agent still working on its previous turn", async () => {
+    const fake = new FakeHerdrBackend({ busy: true });
+    const events = await runWith(fake);
+    assert.equal(fake.promptsSent, 0);
+    assert.equal(doneOf(events).status, "error");
   });
 
   it("watches 10s for pi and 60s for omp", async () => {
@@ -277,6 +300,65 @@ describe("herdr stall recovery", () => {
   it("reports a blocked late start as blocked", async () => {
     const fake = new FakeHerdrBackend({ promptCalls: [stalled()], lateStart: "blocked" });
     assert.equal(doneOf(await runWith(fake)).status, "blocked");
+  });
+});
+
+/** The real HerdrBackend with herdr itself scripted to replay the
+ * nasa-site run: OMP's prompt always stalls, its agent_status never leaves
+ * idle, and its pane shows the boot splash long before any answer. */
+class OmpReplay extends HerdrBackend {
+  prompts: string[] = [];
+  ompDir = "";
+  pane = "$ ";
+  constructor() {
+    super("/tmp");
+  }
+  protected override async runJson(args: string[]) {
+    if (args[1] === "split") return { result: { pane: { pane_id: "w1:pZ" } } };
+    if (args[1] === "start") {
+      this.ompDir = args[args.indexOf("--session-dir") + 1]!;
+      return { result: { argv: ["omp", "--model", args[args.indexOf("--model") + 1]] } };
+    }
+    if (args[1] === "prompt") {
+      this.prompts.push(args[3]!);
+      this.pane = "omp v18  ! to run bash  LSP Servers  Recent sessions";
+      throw new HerdrPromptStalled("stalled");
+    }
+    return { result: { agent: { agent_status: "idle" } } };
+  }
+  override async read() {
+    return this.pane;
+  }
+  override async waitLateStart() {
+    return null; // what omp always gets, after STALL_WATCH_S_OMP
+  }
+}
+
+describe("omp completion (nasa-site replay)", () => {
+  it("returns qa's real answer from its session, not the splash screen", async () => {
+    const fake = new OmpReplay();
+    const plan = writePlan({
+      waves: [[{ name: "qa", prompt: "review the site", model: "claude-sonnet-5", kind: "omp", files: [], display: "herdr" }]],
+    });
+    const results = new Map();
+    // qa works for a while (splash on screen, tool use in the session) before answering
+    const answer = setTimeout(() => {
+      mkdirSync(fake.ompDir, { recursive: true });
+      const file = path.join(fake.ompDir, "2026-09-23T10-04-01-330Z_01a0cdb8.jsonl");
+      const msg = (role: string, text: string, stopReason?: string) =>
+        JSON.stringify({ type: "message", message: { role, stopReason, content: [{ type: "text", text }] } }) + "\n";
+      writeFileSync(file, msg("user", "review the site") + msg("assistant", "", "toolUse"));
+      setTimeout(() => appendFileSync(file, msg("assistant", "QA REPORT: hero title overflows on mobile", "stop")), 1500);
+    }, 200);
+    try {
+      const res = await runAssignmentHerdr(plan.waves[0]![0]!, 0, plan, results, () => {}, null, null,
+        fakeDeps({ herdrBackend: () => fake }));
+      assert.equal(res.status, "pass", res.error);
+      assert.equal(res.text, "QA REPORT: hero title overflows on mobile");
+      assert.equal(fake.prompts.length, 1);
+    } finally {
+      clearTimeout(answer);
+    }
   });
 });
 
@@ -542,7 +624,7 @@ class ScriptedHerdr implements HerdrLike {
     this.prompts.push({ name, text });
   }
   async checkpoint() {
-    return { scrollback: "", replies: 0 };
+    return { scrollback: "", replies: 0, busy: false };
   }
   async reply(name: string) {
     return this.scripts[name]?.shift() ?? `${name} done`;
@@ -551,9 +633,7 @@ class ScriptedHerdr implements HerdrLike {
     return null;
   }
   async waitSettled() {}
-  async waitPaneSettled() {
-    return true;
-  }
+  async waitDone() {}
   sentTo(name: string) {
     return this.prompts.filter((p) => p.name === name).map((p) => p.text);
   }

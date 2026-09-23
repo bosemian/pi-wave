@@ -225,25 +225,38 @@ function backendWithReads(read: () => string): HerdrBackend {
   return b;
 }
 
-describe("pane settled", () => {
-  it("is already changed and stable before the first poll", async () => {
-    // the common real case: by the time status-based recovery gives up
-    // (two attempts x up to 60s each), the agent has often long since
-    // finished and gone quiet - the pane must already differ from the
-    // pre-send baseline and be stable, with no further waiting needed.
+/** Pane reads that follow `script`, then keep changing forever. */
+function scriptedReads(script: string[]): () => string {
+  let n = 0;
+  return () => script[n++] ?? `working ${n}`;
+}
+
+const before = { scrollback: "empty pane", replies: 0, busy: false };
+
+describe("waitDone without a session file", () => {
+  it("returns once the pane changed and then held still for the quiet period", async () => {
     const b = backendWithReads(() => "prompt + PI-WAVE-OMP-OK + idle prompt");
-    assert.equal(await b.waitPaneSettled("x", "empty pane", 5, 0), true);
+    await b.waitDone("x", before, 5, 5, 0.01, 0.05);
   });
 
-  it("returns false when the pane never differs from the baseline", async () => {
-    const b = backendWithReads(() => "same as baseline");
-    assert.equal(await b.waitPaneSettled("x", "same as baseline", 0.05, 0), false);
+  it("keeps waiting through a quiet 2-3s pause mid-work", async () => {
+    // a thinking agent can leave its pane untouched for a few seconds; two
+    // identical reads 1s apart used to be called "done" right there
+    const b = backendWithReads(scriptedReads(["booted", ...Array(5).fill("thinking")]));
+    await assert.rejects(b.waitDone("x", before, 3.5, 60, 0.5), (e: Error) =>
+      e instanceof AgentTimeoutError && e.message.includes("still working"));
   });
 
-  it("returns false while the pane keeps changing", async () => {
-    let n = 0;
-    const b = backendWithReads(() => `typing ${n++}`); // never repeats → never stable
-    assert.equal(await b.waitPaneSettled("x", "empty pane", 0.05, 0), false);
+  it("says it likely never booted when the pane never changed", async () => {
+    const b = backendWithReads(() => "empty pane");
+    await assert.rejects(b.waitDone("x", before, 5, 0.05, 0.01), (e: Error) =>
+      e instanceof AgentTimeoutError && e.message.includes("never changed") && e.message.includes("never finished booting"));
+  });
+
+  it("keeps waiting past the boot window while the pane keeps changing", async () => {
+    const b = backendWithReads(scriptedReads([]));
+    await assert.rejects(b.waitDone("x", before, 0.2, 0.02, 0.01), (e: Error) =>
+      e instanceof AgentTimeoutError && e.message.includes("still working") && !e.message.includes("booting"));
   });
 });
 
@@ -347,22 +360,37 @@ class SessionBackend extends HerdrBackend {
   override async read() {
     return "pane scrollback";
   }
-  sessionArg() {
-    const i = this.cmd.indexOf("--session");
+  sessionArg(flag = "--session") {
+    const i = this.cmd.indexOf(flag);
     return i === -1 ? null : this.cmd[i + 1]!;
   }
 }
 
-const assistant = (text: string) =>
-  JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text }] } }) + "\n";
+const assistant = (text: string, stopReason?: string) =>
+  JSON.stringify({ type: "message", message: { role: "assistant", stopReason, content: [{ type: "text", text }] } }) + "\n";
+const user = (text: string) =>
+  JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text }] } }) + "\n";
+
+/** Where OMP puts its session inside the --session-dir it was given
+ * (captured from omp v18.2.11): a timestamped file plus a hidden lock. */
+function ompSession(dir: string, lines: string) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, ".2026-09-23T10-11-49-553Z_01a0cdc0.jsonl.lock.os"), "");
+  const file = path.join(dir, "2026-09-23T10-11-49-553Z_01a0cdc0.jsonl");
+  writeFileSync(file, lines);
+  return file;
+}
 
 describe("replies from pi session files", () => {
-  it("gives each pi agent its own session file and omp none", async () => {
+  it("gives each pi agent its own session file and each omp agent its own session dir", async () => {
+    // omp has no --session <file>; --session-dir <dir> makes it write
+    // <dir>/<timestamp>_<id>.jsonl directly (no per-cwd subfolder)
     const b = new SessionBackend();
     await b.startAgent("orchestrator", "p1", "openai-codex/gpt-5.5", null, "high");
     assert.ok(b.sessionArg()!.endsWith("orchestrator.jsonl"));
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
     assert.equal(b.sessionArg(), null);
+    assert.equal(path.basename(b.sessionArg("--session-dir")!), "qa");
   });
 
   it("returns only the answer to this prompt, never an earlier one", async () => {
@@ -395,9 +423,64 @@ describe("replies from pi session files", () => {
     assert.equal(await b.reply("builder", since, 2, 0.01), "done");
   });
 
-  it("falls back to the pane scrollback for omp agents", async () => {
+  it("reads an omp agent's reply from its session, not the pane", async () => {
+    // reading the pane returned OMP's splash screen as the agent's answer
     const b = new SessionBackend();
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
-    assert.equal(await b.reply("qa", await b.checkpoint("qa")), "pane scrollback");
+    const since = await b.checkpoint("qa"); // omp has not created its file yet
+    assert.equal(since.replies, 0);
+    ompSession(b.sessionArg("--session-dir")!,
+      user("check the site") + assistant("screenshots taken", "toolUse") + assistant("QA: 2 issues found", "stop"));
+    assert.equal(await b.reply("qa", since, 0.05, 0), "QA: 2 issues found");
+  });
+
+  it("does not count a mid-turn tool-use message as a reply", async () => {
+    const b = new SessionBackend();
+    await b.startAgent("builder", "p1", "kimi-coding/k3", null, "high");
+    writeFileSync(b.sessionArg()!, user("build it") + assistant("let me look first", "toolUse"));
+    const since = await b.checkpoint("builder");
+    assert.equal(since.replies, 0);
+    assert.equal(since.busy, true);
+    assert.equal(await b.reply("builder", since, 0.05, 0), "");
+  });
+
+  it("is not busy once its last turn finished, even with an error", async () => {
+    const b = new SessionBackend();
+    await b.startAgent("builder", "p1", "kimi-coding/k3", null, "high");
+    writeFileSync(b.sessionArg()!, user("build it") + assistant("", "error"));
+    assert.equal((await b.checkpoint("builder")).busy, false);
+  });
+});
+
+describe("waitDone with a session file", () => {
+  it("waits through tool use and quiet pauses until a finished reply lands", async () => {
+    const b = new SessionBackend();
+    await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
+    const dir = b.sessionArg("--session-dir")!;
+    const since = { scrollback: "shell prompt", replies: 0, busy: false };
+    // the pane ("pane scrollback") never moves again after its first change:
+    // a pane-only check would have called this done straight away
+    const file = ompSession(dir, user("check the site") + assistant("", "toolUse"));
+    setTimeout(() => appendFileSync(file, assistant("QA: all good", "stop")), 150);
+    const started = performance.now();
+    await b.waitDone("qa", since, 5, 5, 0.01, 0.01);
+    assert.ok(performance.now() - started >= 140, "returned before the reply landed");
+    assert.equal(await b.reply("qa", since, 0, 0), "QA: all good");
+  });
+
+  it("times out as still working while the pane changes but no reply lands", async () => {
+    const b = new SessionBackend();
+    await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
+    let n = 0;
+    b.read = async () => `working ${n++}`;
+    await assert.rejects(b.waitDone("qa", { scrollback: "", replies: 0, busy: false }, 0.1, 0.02, 0.01), (e: Error) =>
+      e instanceof AgentTimeoutError && e.message.includes("still working"));
+  });
+
+  it("times out as gone quiet when the pane stopped changing without a reply", async () => {
+    const b = new SessionBackend();
+    await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
+    await assert.rejects(b.waitDone("qa", { scrollback: "", replies: 0, busy: false }, 0.1, 0.02, 0.01, 0.03), (e: Error) =>
+      e instanceof AgentTimeoutError && e.message.includes("without finishing a reply"));
   });
 });

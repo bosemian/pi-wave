@@ -236,8 +236,8 @@ never answered. Errors when run outside Herdr.
 `headless` (forced): `pi --mode rpc` background processes — structured events,
 token/cost stats, machine-grade result text, nothing to look at.
 
-Trade-offs in herdr mode: no token/cost stats, and the result text is pane
-scrollback (includes TUI chrome). Everything else (plan validation,
+Trade-offs in herdr mode: no token/cost stats; the result text is the
+agent's last reply read from its session file. Everything else (plan validation,
 file-conflict rule, fix rounds, review, stop-on-failure, `mcp_config`)
 behaves identically in all modes, and you can mix per assignment.
 
@@ -252,15 +252,18 @@ the agent never wakes (max two attempts total) before falling back;
 `kind: "omp"` skips the resend and goes straight to the pane-settled
 fallback below after its one attempt — see why in the next paragraph.
 
-**Pane-settled fallback** — if herdr's status field never confirms a
-wake, the engine falls back to watching the pane's scrollback itself —
-`prompt_stall_pane_check` in the JSONL — comparing against a baseline
-captured before the first prompt was ever sent, and only raises the
-timeout if the pane never differs from that baseline within the watch
-window. A pane that differs and has gone quiet is treated as settled,
-even if that happened well before the fallback check started (the common
-case: by the time a status-based attempt is exhausted, the agent has
-often long since finished).
+**Wait-for-done fallback** - if herdr's status field never confirms a
+wake (always the case for OMP), the engine waits for the agent to finish
+on its own - `prompt_stall_pane_check` in the JSONL - for up to the
+assignment's `timeout`, not the watch window. Both kinds record a session
+(pi via `--session <file>`, OMP via `--session-dir <dir>`), so "finished"
+means the session gained a reply that ended the turn (an assistant message
+that did not stop for tool use), and that reply, not the pane, is the
+agent's result. A pane that keeps changing is an agent at work; the
+timeout error says which case it hit: the pane never changed within the
+watch window (likely never booted), it was still changing at the deadline
+(still working), or it went quiet without a reply. The engine also never
+prompts an agent whose session shows it still mid-turn.
 
 **Bugs found live on 2026-09-14, both fixed**: (1) the status lookup was
 reading the wrong JSON key — herdr's `agent get` reports the agent's live

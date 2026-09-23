@@ -121,8 +121,8 @@ not rare — herdr's `agent_status` never leaves idle for `kind: "omp"` at
 all, so the status-based wake check always exhausts. This exercises the
 full recovery chain end-to-end on the OMP CLI itself: one stall →
 `prompt_stall_recovery` → status wait exhausts → `prompt_stall_pane_check`
-→ `HerdrBackend.waitPaneSettled` catches the real completion from the
-pane's own scrollback.
+→ `HerdrBackend.waitDone` catches the real completion from the OMP
+session file (`--session-dir`).
 
 Free check first:
 

@@ -14,7 +14,7 @@
 // - panes are left open after the run for the user to inspect.
 
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AgentTimeoutError } from "./errors.ts";
@@ -22,6 +22,10 @@ import { AgentTimeoutError } from "./errors.ts";
 type Json = Record<string, any>;
 
 export const READ_LINES = 240;
+/** How long a pane must hold still before an agent without a session file
+ * counts as done: a working TUI animates, but a thinking model can leave
+ * it untouched for several seconds. */
+export const PANE_QUIET_S = 30;
 
 export class HerdrError extends Error {
   override name = "HerdrError";
@@ -136,23 +140,28 @@ export function findKey(obj: unknown, key: string): any {
 const head = (args: string[]) => args.slice(0, 3).join(" ");
 
 /** Where an agent was before a prompt: its pane scrollback (for the
- * pane-settled fallback) and how many replies its session held. */
+ * wait-for-done fallback), how many replies its session held, and whether
+ * it was still mid-turn (its session's last message is not a reply). */
 export interface Checkpoint {
   scrollback: string;
   replies: number;
+  busy: boolean;
 }
 
-/** Final text of every assistant message in a pi session file, in order.
- * A missing file (nothing sent yet) has none; a line still being written
- * is skipped. */
-function sessionReplies(file: string): string[] {
-  let raw: string;
+/** The replies in a pi or OMP session file (both write the same entries),
+ * in order, and whether its last message leaves a turn open. A reply is an
+ * assistant message that ended its turn: one that stopped for tool use is
+ * mid-turn, the agent keeps going after the tool results. A missing file
+ * (nothing sent yet) has none; a line still being written is skipped. */
+function sessionReplies(file: string | null): { replies: string[]; busy: boolean } {
+  let raw = "";
   try {
-    raw = readFileSync(file, "utf8");
+    if (file) raw = readFileSync(file, "utf8");
   } catch {
-    return [];
+    // not created yet
   }
   const replies: string[] = [];
+  let busy = false;
   for (const line of raw.split("\n")) {
     let entry: Json;
     try {
@@ -161,11 +170,13 @@ function sessionReplies(file: string): string[] {
       continue;
     }
     const msg = entry?.type === "message" ? entry.message : null;
-    if (msg?.role !== "assistant") continue;
+    if (!msg) continue;
+    busy = msg.role !== "assistant" || msg.stopReason === "toolUse";
+    if (busy) continue;
     const content: Json[] = Array.isArray(msg.content) ? msg.content : [];
     replies.push(content.filter((c) => c.type === "text").map((c) => c.text ?? "").join(""));
   }
-  return replies;
+  return { replies, busy };
 }
 
 export class HerdrBackend {
@@ -173,9 +184,10 @@ export class HerdrBackend {
 
   protected readonly cwd: string;
   private readonly signal: AbortSignal | undefined;
-  /** pi-kind agents record their conversation here (--session), so replies
-   * are read exactly instead of scraped from the pane's scrollback. */
-  private readonly sessions = new Map<string, string>();
+  /** Agents record their conversation here, so replies are read exactly
+   * instead of scraped from the pane's scrollback: pi to the file named by
+   * --session, omp to the one file it creates in its own --session-dir. */
+  private readonly sessions = new Map<string, { file: string } | { dir: string }>();
   private sessionDir: string | null = null;
 
   /** Aborting `signal` kills any herdr command still running (e.g. a
@@ -294,11 +306,16 @@ export class HerdrBackend {
     // hand it this assignment's config
     if (mcpConfig) extra.push("--mcp-config", expandUser(mcpConfig));
     if (systemPrompt && kind === "pi") extra.push("--append-system-prompt", systemPrompt);
+    this.sessionDir ??= mkdtempSync(path.join(os.tmpdir(), "pi-wave-sessions-"));
     if (kind === "pi") {
-      this.sessionDir ??= mkdtempSync(path.join(os.tmpdir(), "pi-wave-sessions-"));
       const file = path.join(this.sessionDir, `${name}.jsonl`);
       extra.push("--session", file);
-      this.sessions.set(name, file);
+      this.sessions.set(name, { file });
+    } else if (kind === "omp") {
+      // omp has no --session <file>; it names its own file in this dir
+      const dir = path.join(this.sessionDir, name);
+      extra.push("--session-dir", dir);
+      this.sessions.set(name, { dir });
     }
     const resp = await this.runJson(
       ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", "60000", "--", ...extra],
@@ -373,55 +390,89 @@ export class HerdrBackend {
     }
   }
 
-  /** Status-independent fallback for when herdr's own status field never
-   * confirms a wake. `baseline` must be the pane's scrollback captured
-   * BEFORE the first (stalled) prompt was sent - not a fresh read taken
-   * now: by the time every status-based attempt has been exhausted, the
-   * agent has often already finished and gone quiet, so a "watch it change
-   * from here" check would see nothing and miss it. True once the pane
-   * differs from that baseline and has held stable for `stablePolls`
-   * consecutive reads (whether that stability was reached just now or well
-   * before this call started); false if the pane never differs from the
-   * baseline at all within timeoutS (genuinely idle, not a false
-   * notification). */
-  async waitPaneSettled(name: string, baseline: string, timeoutS: number, pollS = 1, stablePolls = 2): Promise<boolean> {
-    const deadline = performance.now() + timeoutS * 1000;
-    let last: string | null = null;
-    let stable = 0;
+  /** The session file an agent records to, or null if it has none (yet):
+   * omp creates `<timestamp>_<id>.jsonl` (plus a hidden lock file) in its
+   * --session-dir once it starts. */
+  private sessionFile(name: string): string | null {
+    const s = this.sessions.get(name);
+    if (!s) return null;
+    if ("file" in s) return s.file;
+    try {
+      const files = readdirSync(s.dir).filter((f) => f.endsWith(".jsonl") && !f.startsWith("."));
+      return files.length ? path.join(s.dir, files.sort().at(-1)!) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Status-independent wait for an agent whose herdr status never
+   * confirmed it took the prompt (always the case for omp).
+   *
+   * Done means: with a session file, the session gained a reply since
+   * `since` - a message that ended the turn, not a tool-use step; without
+   * one, the pane differs from `since.scrollback` (read BEFORE the prompt
+   * was sent, so an agent that already finished counts) and has then held
+   * still for quietS. Either way the wait is bounded by timeoutS, and the
+   * pane tells why it gave up: never changed within bootS (it never took
+   * the prompt - likely never finished booting), still changing at the
+   * deadline (still working), or quiet without a reply. A pane that keeps
+   * changing is an agent at work, never a stall. */
+  async waitDone(
+    name: string,
+    since: Checkpoint,
+    timeoutS: number,
+    bootS: number,
+    pollS = 1,
+    quietS = PANE_QUIET_S,
+  ): Promise<void> {
+    const hasSession = this.sessions.has(name);
+    const start = performance.now();
+    let last = since.scrollback;
+    let changedAt: number | null = null;
     while (true) {
+      if (hasSession && sessionReplies(this.sessionFile(name)).replies.length > since.replies) return;
       const text = await this.read(name);
-      if (text !== baseline) {
-        stable = text === last ? stable + 1 : 1;
-        if (stable >= stablePolls) return true;
-      } else {
-        stable = 0;
-      }
+      const now = performance.now();
+      if (text !== last) changedAt = now;
       last = text;
-      if (performance.now() >= deadline) return false;
+      const quiet = changedAt !== null && now - changedAt >= quietS * 1000;
+      if (!hasSession && quiet) return;
+      if (changedAt === null && now - start >= bootS * 1000) {
+        throw new AgentTimeoutError(
+          `[${name}] its pane never changed within ${Math.round(bootS)}s of the prompt - ` +
+            `it likely never finished booting`,
+        );
+      }
+      if (now - start >= timeoutS * 1000) {
+        throw new AgentTimeoutError(
+          quiet
+            ? `[${name}] its pane went quiet without finishing a reply within the ${Math.round(timeoutS)}s timeout`
+            : `[${name}] still working at the ${Math.round(timeoutS)}s timeout (its pane was still changing)`,
+        );
+      }
       await sleep(pollS);
     }
   }
 
   /** Snapshot taken before a prompt; pass it to reply() afterwards. */
   async checkpoint(name: string): Promise<Checkpoint> {
-    const file = this.sessions.get(name);
-    return { scrollback: await this.read(name), replies: file ? sessionReplies(file).length : 0 };
+    const { replies, busy } = sessionReplies(this.sessionFile(name));
+    return { scrollback: await this.read(name), replies: replies.length, busy };
   }
 
   /** The agent's answer to the prompt sent after `since`.
    *
-   * pi agents: the last assistant message their session gained since then,
-   * or "" if they gained none (a stale earlier reply, e.g. a previous
-   * VERDICT in the orchestrator pane, is never returned). pi writes the
-   * message as the turn ends, so a short grace covers a settle that is
-   * reported a moment before the write. Agents without a session file
-   * (kind omp) fall back to the pane scrollback. */
+   * Agents with a session file: the last reply their session gained since
+   * then, or "" if they gained none (a stale earlier reply, e.g. a previous
+   * VERDICT in the orchestrator pane, is never returned). The reply is
+   * written as the turn ends, so a short grace covers a settle that is
+   * reported a moment before the write. Agents without one fall back to
+   * the pane scrollback. */
   async reply(name: string, since: Checkpoint, graceS = 3, pollS = 0.25): Promise<string> {
-    const file = this.sessions.get(name);
-    if (!file) return this.read(name);
+    if (!this.sessions.has(name)) return this.read(name);
     const deadline = performance.now() + graceS * 1000;
     while (true) {
-      const replies = sessionReplies(file);
+      const { replies } = sessionReplies(this.sessionFile(name));
       if (replies.length > since.replies) return replies.at(-1) ?? "";
       if (performance.now() >= deadline) return "";
       await sleep(pollS);

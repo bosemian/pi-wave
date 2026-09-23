@@ -12,6 +12,7 @@ import {
   type Checkpoint,
   HerdrBackend,
   HerdrBlocked,
+  HerdrError,
   HerdrPromptStalled,
   Mutex,
   PaneLayout,
@@ -146,7 +147,7 @@ export const MAX_SYNC_ROUNDS = 2;
 /** The parts of HerdrBackend the engine drives (tests pass fakes). */
 export type HerdrLike = Pick<
   HerdrBackend,
-  "splitPane" | "startAgent" | "prompt" | "checkpoint" | "reply" | "waitLateStart" | "waitSettled" | "waitPaneSettled"
+  "splitPane" | "startAgent" | "prompt" | "checkpoint" | "reply" | "waitLateStart" | "waitSettled" | "waitDone"
 >;
 /** The parts of PiRpcSession the engine drives (tests pass fakes). */
 export type SessionLike = Pick<
@@ -423,6 +424,10 @@ export class OrchestratorPane {
 
 /** Prompt a herdr agent, recovering from submission stalls.
  *
+ * Refuses to prompt an agent whose session shows it still mid-turn: a
+ * prompt typed into a working agent's pane corrupts its turn (observed: a
+ * FIX ROUND sent to an OMP agent still doing its first task).
+ *
  * herdr requires a state change within its hard 5s window after a
  * submission from idle; a freshly spawned CLI can take far longer to boot
  * and the submission may still kick in late. On a stall: watch for a late
@@ -435,7 +440,7 @@ export class OrchestratorPane {
  * in that case would just re-submit the same prompt to an agent that is
  * already working or already done, risking duplicate work - observed live
  * as the pane running the assignment twice. So for omp, one stall goes
- * straight to the pane-settled fallback; kind=pi (whose status field is
+ * straight to the wait-for-done fallback; kind=pi (whose status field is
  * reliable) keeps resending once before falling back. */
 async function promptHerdr(
   backend: HerdrLike,
@@ -445,6 +450,9 @@ async function promptHerdr(
   emit: Emitter,
   deps: Deps,
 ): Promise<void> {
+  if (since.busy) {
+    throw new HerdrError(`[${a.name}] is still working on its previous turn - not sending it another prompt`);
+  }
   const watchS = a.kind === "omp" ? STALL_WATCH_S_OMP : STALL_WATCH_S;
   const maxAttempts = a.kind === "omp" ? 1 : MAX_PROMPT_ATTEMPTS;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -465,16 +473,12 @@ async function promptHerdr(
     }
     if (attempt < maxAttempts) await deps.sleep(2);
   }
-  // status never confirmed a wake (expected every time for omp) - before
-  // declaring failure, check the pane itself: its own notification can
-  // simply not fire while the agent is genuinely working (see
-  // HerdrBackend.waitPaneSettled).
-  emit({ type: "prompt_stall_pane_check", agent: a.name, watch_s: watchS });
-  if (await backend.waitPaneSettled(a.name, since.scrollback, watchS)) return;
-  throw new AgentTimeoutError(
-    `[${a.name}] prompt stalled ${maxAttempts}x and the agent stayed ` +
-      `idle for ${Math.round(watchS)}s - it likely never finished booting`,
-  );
+  // status never confirmed a wake (expected every time for omp) - the
+  // agent may well be working anyway, so wait for its session reply (or
+  // its pane to settle) for as long as the assignment allows; see
+  // HerdrBackend.waitDone.
+  emit({ type: "prompt_stall_pane_check", agent: a.name, watch_s: watchS, timeout_s: a.timeout });
+  await backend.waitDone(a.name, since, a.timeout, watchS);
 }
 
 /** Map an exception from an agent run onto its result status. */
