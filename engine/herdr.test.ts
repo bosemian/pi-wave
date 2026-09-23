@@ -346,6 +346,61 @@ describe("prompt settle state", () => {
   });
 });
 
+/** HerdrBackend whose herdr process answers from a script, the last
+ * reply repeating. */
+class ScriptedBackend extends HerdrBackend {
+  calls = 0;
+  private readonly replies: [number, string, string][];
+  constructor(replies: [number, string, string][]) {
+    super("/tmp");
+    this.replies = replies;
+  }
+  protected override async run(): Promise<[number, string, string]> {
+    return this.replies[Math.min(this.calls++, this.replies.length - 1)]!;
+  }
+}
+
+// herdr 0.9.1, captured live: `agent start` right after `pane split`
+// sometimes lands before the new pane's shell is up, and herdr refuses at
+// once instead of waiting; the same start ~0.5s later succeeds
+const paneBusy: [number, string, string] = [
+  1,
+  JSON.stringify({
+    error: { code: "agent_pane_busy", message: "agent target pane w1:p11 is not an available shell" },
+    id: "cli:agent:start",
+  }),
+  "",
+];
+const started: [number, string, string] = [
+  0,
+  JSON.stringify({ result: { agent: { argv: ["pi", "--model", "openai-codex/gpt-5.5"] } } }),
+  "",
+];
+
+describe("startAgent on a fresh pane", () => {
+  it("retries while the new pane's shell is not up yet", async () => {
+    const b = new ScriptedBackend([paneBusy, paneBusy, started]);
+    await b.startAgent("design", "w1:p11", "openai-codex/gpt-5.5", null, "high", { pollS: 0 });
+    assert.equal(b.calls, 3);
+  });
+
+  it("gives up with herdr's error once the pane stays busy", async () => {
+    const b = new ScriptedBackend([paneBusy]);
+    await assert.rejects(
+      b.startAgent("design", "w1:p11", "openai-codex/gpt-5.5", null, "high", { readyS: 0.05, pollS: 0 }),
+      (e: Error) => e.message.includes("agent_pane_busy"),
+    );
+    assert.ok(b.calls > 1);
+  });
+
+  it("does not retry other start errors", async () => {
+    const taken: [number, string, string] = [1, JSON.stringify({ error: { code: "agent_name_taken" } }), ""];
+    const b = new ScriptedBackend([taken, started]);
+    await assert.rejects(b.startAgent("design", "w1:p11", "openai-codex/gpt-5.5", null, "high", { pollS: 0 }));
+    assert.equal(b.calls, 1);
+  });
+});
+
 /** HerdrBackend that records the herdr command startAgent builds and
  * serves a fixed pane scrollback. */
 class SessionBackend extends HerdrBackend {

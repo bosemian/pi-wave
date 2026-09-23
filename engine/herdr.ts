@@ -46,7 +46,14 @@ export class HerdrPromptStalled extends AgentTimeoutError {
   override name = "HerdrPromptStalled";
 }
 
-export const sleep = (s: number) => new Promise<void>((resolve) => setTimeout(resolve, s * 1000));
+/** `agent start` found the pane not at its interactive shell prompt. herdr
+ * refuses at once rather than waiting, which can happen for a pane split
+ * a few milliseconds earlier whose shell is not up yet. */
+export class HerdrPaneBusy extends HerdrError {
+  override name = "HerdrPaneBusy";
+}
+
+export const sleep =(s: number) => new Promise<void>((resolve) => setTimeout(resolve, s * 1000));
 
 const expandUser = (p: string) =>
   p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
@@ -251,6 +258,9 @@ export class HerdrBackend {
       if (code.includes("timeout")) {
         throw new AgentTimeoutError(`herdr timed out waiting for the agent: ${detail}`);
       }
+      if (code === "agent_pane_busy") {
+        throw new HerdrPaneBusy(`herdr ${head(args)}... failed (exit ${rc}): ${detail}`);
+      }
       throw new HerdrError(`herdr ${head(args)}... failed (exit ${rc}): ${detail}`);
     }
     if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
@@ -286,14 +296,21 @@ export class HerdrBackend {
    * kind "omp" runs the OMP CLI with a bare model id (the delegate-wave
    * rule: only Sonnet goes through OMP). systemPrompt, when set, is
    * appended to the pi agent's system prompt - role constraints that must
-   * hold before any prompt arrives (pi kind only). */
+   * hold before any prompt arrives (pi kind only). A pane whose shell is
+   * not up yet (HerdrPaneBusy) is retried for up to readyS seconds. */
   async startAgent(
     name: string,
     paneId: string,
     model: string,
     provider: string | null,
     thinking: string,
-    { mcpConfig = "", kind = "pi", systemPrompt = "" }: { mcpConfig?: string; kind?: string; systemPrompt?: string } = {},
+    {
+      mcpConfig = "",
+      kind = "pi",
+      systemPrompt = "",
+      readyS = 10,
+      pollS = 0.25,
+    }: { mcpConfig?: string; kind?: string; systemPrompt?: string; readyS?: number; pollS?: number } = {},
   ): Promise<string[]> {
     const modelArg =
       kind === "omp"
@@ -317,10 +334,18 @@ export class HerdrBackend {
       extra.push("--session-dir", dir);
       this.sessions.set(name, { dir });
     }
-    const resp = await this.runJson(
-      ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", "60000", "--", ...extra],
-      90,
-    );
+    const args = ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", "60000", "--", ...extra];
+    const deadline = Date.now() + readyS * 1000;
+    let resp: Json;
+    for (;;) {
+      try {
+        resp = await this.runJson(args, 90);
+        break;
+      } catch (e) {
+        if (!(e instanceof HerdrPaneBusy) || Date.now() >= deadline) throw e;
+        await sleep(pollS);
+      }
+    }
     const argv = findKey(resp.result ?? resp, "argv");
     if (!Array.isArray(argv)) {
       throw new HerdrError(`agent start returned no argv: ${JSON.stringify(resp).slice(0, 300)}`);
