@@ -128,6 +128,10 @@ describe("cli run", () => {
     assert.equal(r.events.at(-1)!.status, "stopped");
     assert.ok(r.events.at(-1)!.reason.includes("on_failure is 'stop'"));
     assert.ok(!r.events.some((e) => e.agent === "wave-2-never"));
+    // no dashboard, but the run still keeps its state for a resume
+    const runDir = r.events.at(-1)!.run_dir;
+    assert.ok(existsSync(path.join(runDir, "state.json")));
+    assert.ok(!existsSync(path.join(runDir, "dashboard.md")));
   });
 
   it("terminates child agents on SIGTERM and exits 130", async () => {

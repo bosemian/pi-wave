@@ -11,6 +11,7 @@ import { Notifier } from "./notify.ts";
 import { defaultDeps, orchestrate } from "./orchestrator.ts";
 import { type Plan, PlanError, applyOverrides, loadPlan } from "./plan.ts";
 import { PiRpcError } from "./rpc.ts";
+import { newRunDir } from "./state.ts";
 
 type Json = Record<string, any>;
 
@@ -105,7 +106,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   if (args.values["dry-run"]) return dryRun(plan);
 
-  const notifier = Notifier.create(plan);
+  const runDir = newRunDir(plan.name);
+  const notifier = Notifier.create(plan, runDir);
   if (notifier) say(`progress dashboard: ${notifier.dashboardPath}`);
 
   const controller = new AbortController();
@@ -125,6 +127,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
           notifier?.handle(obj);
         },
         { ...defaultDeps, signal: controller.signal },
+        { runDir },
       ),
       gaveUp,
     ]);

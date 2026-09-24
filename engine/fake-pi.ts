@@ -1,6 +1,9 @@
 // Test helper: a fake `pi --mode rpc` that speaks just enough of the RPC
-// protocol. FAKE_PI_MODE picks a scenario; argv is recorded to FAKE_PI_ARGV
-// and the pid to FAKE_PI_PIDFILE when those are set.
+// protocol. FAKE_PI_MODE picks a scenario (second-silent: only the first
+// prompt gets an assistant message; dialog: an extension dialog blocks the
+// prompt; notify: a fire-and-forget extension notice precedes the reply);
+// argv is recorded to FAKE_PI_ARGV and the pid to FAKE_PI_PIDFILE when those
+// are set.
 
 import { chmodSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -23,6 +26,7 @@ const reply = (cmd, data, extra = {}) =>
   out({ type: "response", id: cmd.id, command: cmd.type, success: true, data, ...extra });
 process.stdout.write("not json, ignored\\n\\n");
 let buf = "";
+let prompts = 0;
 process.stdin.on("data", (chunk) => {
   buf += chunk;
   let i;
@@ -39,13 +43,19 @@ function handle(cmd) {
       return reply(cmd, { model: { id: process.env.FAKE_PI_MODEL_ID || model.split("/").pop() } });
     case "prompt":
       reply(cmd);
+      prompts += 1;
+      if (mode === "dialog") {
+        // an extension asks the user and blocks until answered
+        return out({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Allow rm -rf build/?" });
+      }
+      if (mode === "notify") out({ type: "extension_ui_request", id: "ui-2", method: "notify", message: "fyi" });
       if (mode === "crash") {
         process.stderr.write("fatal: provider exploded\\n");
         process.exit(3);
       }
       if (mode === "hang") return;
       out({ type: "turn_end" });
-      if (mode !== "no-message") {
+      if (mode !== "no-message" && !(mode === "second-silent" && prompts > 1)) {
         out({ type: "message_end", message: { role: "assistant",
           content: [{ type: "text", text: "echo: " }, { type: "tool" }, { type: "text", text: cmd.message }] } });
       }

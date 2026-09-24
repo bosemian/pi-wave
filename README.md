@@ -14,7 +14,7 @@ TypeScript on Node ≥ 24 (runs `.ts` directly, no build step), **zero runtime d
 pi agent (your orchestrator thread)
   └─ calls tool: dispatch_wave { plan: {...} | "/abs/plan.json" }
        └─ extension/dispatch-wave.ts  →  engine/ (in the same pi process)
-            └─ per assignment: spawn pi --mode rpc --no-session --no-extensions
+            └─ per assignment: spawn pi --mode rpc --session <run>/sessions/<name>.jsonl --no-extensions
                  ├─ prompt → agent_settled → get_last_assistant_text
                  ├─ review_cmd exit code? fail → ONE consolidated fix prompt (max N)
                  └─ get_session_stats (tokens/cost) → terminate
@@ -92,6 +92,19 @@ installed can delegate waves correctly. No skill has to be loaded or edited:
 - The `dispatch_wave` tool accepts the plan **inline** (an object) or as a
   path - the agent never hand-edits a file.
 
+## Run dir
+
+Every real run (not `--dry-run`) gets its own dir,
+`~/.pi-wave/progress/<plan>-<timestamp>/`, and `~/.pi-wave/progress/latest`
+points at the newest one. The summary names it as `run_dir`. It holds:
+
+- `state.json` - the plan, every finished agent's full result and every
+  wave sync, rewritten atomically after each agent and each wave, so it
+  survives an abort or a crash mid-wave
+- `sessions/` - each agent's pi session (`<name>.jsonl`; OMP agents get a
+  `<name>/` dir), also named per agent as `session` in the summary
+- the dashboard files below, unless `PI_WAVE_PROGRESS=off`
+
 ## Progress dashboard & notifications
 
 Every real run (not `--dry-run`) feeds two side channels from the same
@@ -111,8 +124,9 @@ events, while stdout stays pure JSONL for the extension:
 Both sinks are best-effort: a failure (e.g. notifications not permitted)
 prints to stderr and never stops the run.
 
-Env overrides: `PI_WAVE_PROGRESS_DIR` moves the dashboards (default
-`~/.pi-wave/progress`), `PI_WAVE_PROGRESS=off` disables the files,
+Env overrides: `PI_WAVE_PROGRESS_DIR` moves the run dirs (default
+`~/.pi-wave/progress`), `PI_WAVE_PROGRESS=off` disables the dashboard files
+(the run dir with its state and sessions is still kept),
 `PI_WAVE_NOTIFY=off` disables notifications (default on under macOS).
 
 ### Reading the overview from a desktop bot
@@ -212,11 +226,11 @@ No absolute paths anywhere in the repo. Conventions:
 | `thinking` | | `high` | `off…max` |
 | `files` | | `[]` | exact files the agent may touch; `[]` = read-only assignment |
 | `done_when` | | | definition of done, injected into the prompt |
-| `review_cmd` | | | shell command; exit 0 = pass, otherwise output becomes the fix-round feedback |
+| `review_cmd` | | | shell command; exit 0 = pass, otherwise output becomes the fix-round feedback (over 8,000 chars, the middle is cut) |
 | `max_fix_rounds` | | `2` | consolidated re-prompts to the same agent session |
 | `timeout` | | `600` | seconds per prompt round |
 | `needs_results` | | `[]` | names of earlier-wave agents whose final texts are injected |
-| `load_extensions` | | `false` | keep false — see recursion guard below |
+| `load_extensions` | | `false` | keep false — see recursion guard below; an extension dialog (select/confirm/input/editor) is reported as status `blocked`, never answered |
 | `display` | plan-level, default `headless` | | `herdr` = run the agent live in a Herdr pane (requires the engine to run inside Herdr) |
 
 ## Display backends: `auto` (default), `herdr`, `headless`

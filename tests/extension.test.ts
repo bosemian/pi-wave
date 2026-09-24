@@ -66,6 +66,8 @@ describe("dispatch_wave extension", () => {
     assert.equal(JSON.parse(updates[0]!).type, "plan_start");
     assert.equal(JSON.parse(updates.at(-1)!).type, "summary");
     assert.ok(readFileSync(result.details.dashboard, "utf8").includes("✅ pass"));
+    assert.equal(path.dirname(result.details.dashboard), summary.run_dir);
+    assert.ok(existsSync(path.join(summary.run_dir, "state.json")));
   });
 
   it("resolves a relative plan path and applies overrides", async () => {

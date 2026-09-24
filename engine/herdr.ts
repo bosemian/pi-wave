@@ -14,7 +14,7 @@
 // - panes are left open after the run for the user to inspect.
 
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AgentTimeoutError } from "./errors.ts";
@@ -203,10 +203,13 @@ export class HerdrBackend {
   private sessionDir: string | null = null;
 
   /** Aborting `signal` kills any herdr command still running (e.g. a
-   * `prompt --wait`), so a cancelled run does not wait out its timeout. */
-  constructor(cwd: string, signal?: AbortSignal) {
+   * `prompt --wait`), so a cancelled run does not wait out its timeout.
+   * Agents record their sessions in `sessionDir` (the run's), or in a
+   * temp dir without one. */
+  constructor(cwd: string, signal?: AbortSignal, sessionDir?: string) {
     this.cwd = cwd;
     this.signal = signal;
+    this.sessionDir = sessionDir ?? null;
   }
 
   protected run(args: string[], timeoutS = 60): Promise<[number, string, string]> {
@@ -329,6 +332,7 @@ export class HerdrBackend {
     if (mcpConfig) extra.push("--mcp-config", expandUser(mcpConfig));
     if (systemPrompt && kind === "pi") extra.push("--append-system-prompt", systemPrompt);
     this.sessionDir ??= mkdtempSync(path.join(os.tmpdir(), "pi-wave-sessions-"));
+    mkdirSync(this.sessionDir, { recursive: true });
     if (kind === "pi") {
       const file = path.join(this.sessionDir, `${name}.jsonl`);
       extra.push("--session", file);
@@ -423,7 +427,7 @@ export class HerdrBackend {
   /** The session file an agent records to, or null if it has none (yet):
    * omp creates `<timestamp>_<id>.jsonl` (plus a hidden lock file) in its
    * --session-dir once it starts. */
-  private sessionFile(name: string): string | null {
+  sessionFile(name: string): string | null {
     const s = this.sessions.get(name);
     if (!s) return null;
     if ("file" in s) return s.file;

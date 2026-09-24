@@ -12,7 +12,7 @@ const tmp = mkdtempSync(path.join(os.tmpdir(), "pi-wave-rpc-"));
 // Read once at import time by rpc.ts, so set it before the dynamic import.
 process.env.PI_WAVE_MCP_ADAPTER = path.join(tmp, "no-such-adapter.ts");
 const { PiRpcError, PiRpcSession, listPiModels, mcpFlags } = await import("./rpc.ts");
-const { AgentTimeoutError } = await import("./errors.ts");
+const { AgentBlockedError, AgentTimeoutError } = await import("./errors.ts");
 
 const piBin = writeFakePi(tmp);
 const argvFile = path.join(tmp, "argv.json");
@@ -52,6 +52,15 @@ describe("PiRpcSession", () => {
     ]);
   });
 
+  it("records the session to the given file instead of --no-session", async () => {
+    const file = path.join(tmp, "sessions", "wave-1-code.jsonl");
+    const { s } = session("ok", { sessionFile: file });
+    await s.start();
+    const argv: string[] = JSON.parse(readFileSync(argvFile, "utf8"));
+    assert.ok(!argv.includes("--no-session"));
+    assert.equal(argv[argv.indexOf("--session") + 1], file);
+  });
+
   it("omits --no-extensions when load_extensions is set", async () => {
     const { s } = session("ok", { loadExtensions: true });
     await s.start();
@@ -83,6 +92,33 @@ describe("PiRpcSession", () => {
     await s.start();
     await s.promptAndSettle("hi", 5);
     assert.equal(await s.lastText(), "from get_last_assistant_text");
+  });
+
+  it("never hands back an earlier prompt's text", async () => {
+    // a fix round that ends without an assistant message must not look like
+    // the first round's report
+    const { s } = session("second-silent");
+    await s.start();
+    await s.promptAndSettle("first", 5);
+    assert.equal(await s.lastText(), "echo: first");
+    await s.promptAndSettle("second", 5);
+    assert.equal(await s.lastText(), "from get_last_assistant_text");
+  });
+
+  it("reports an extension dialog as blocked instead of waiting it out", async () => {
+    const { s } = session("dialog", { loadExtensions: true });
+    await s.start();
+    const started = performance.now();
+    await assert.rejects(s.promptAndSettle("hi", 30), (e: Error) =>
+      e instanceof AgentBlockedError && e.message.includes("Allow rm -rf build/?"));
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  it("ignores fire-and-forget extension notices", async () => {
+    const { s } = session("notify", { loadExtensions: true });
+    await s.start();
+    await s.promptAndSettle("hi", 5);
+    assert.equal(await s.lastText(), "echo: hi");
   });
 
   it("times out a prompt that never settles, after aborting it", async () => {

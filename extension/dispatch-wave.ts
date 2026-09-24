@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { Notifier } from "../engine/notify.ts";
 import { defaultDeps, orchestrate } from "../engine/orchestrator.ts";
 import { type Plan, PlanError, applyOverrides, loadPlan, parsePlan } from "../engine/plan.ts";
+import { newRunDir } from "../engine/state.ts";
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
@@ -98,7 +99,8 @@ export default function (pi: ExtensionAPI) {
       // Sink failures (e.g. a chat push without Accessibility permission)
       // must not write to pi's terminal; they travel as tool updates.
       const warnings: string[] = [];
-      const notifier = Notifier.create(plan, (msg) => {
+      const runDir = newRunDir(plan.name);
+      const notifier = Notifier.create(plan, runDir, (msg) => {
         warnings.push(msg);
         update(`warning: ${msg}`);
       });
@@ -110,6 +112,7 @@ export default function (pi: ExtensionAPI) {
             update(JSON.stringify(ev));
           },
           { ...defaultDeps, signal },
+          { runDir },
         );
         return {
           content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],

@@ -2,7 +2,7 @@
 // Run from the repo root: npm test
 
 import assert from "node:assert/strict";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, it } from "node:test";
@@ -157,23 +157,16 @@ describe("Notifier", () => {
     assert.equal(fail[3], true);
   });
 
-  it("points the latest symlink at the run dir", () => {
-    feed(EVENTS.slice(0, 1));
-    const latest = path.join(path.dirname(runDir), "latest");
-    assert.ok(lstatSync(latest).isSymbolicLink());
-    assert.equal(realpathSync(latest), realpathSync(runDir));
-  });
-
   it("reads its settings from the environment", async () => {
     const dir = path.join(tmp, "env-progress");
-    await withEnv({ PI_WAVE_PROGRESS_DIR: dir, PI_WAVE_NOTIFY: "off" }, async () => {
-      const n = Notifier.create(plan);
+    await withEnv({ PI_WAVE_NOTIFY: "off" }, async () => {
+      const n = Notifier.create(plan, dir);
       assert.ok(n);
-      assert.ok(n.dashboardPath.startsWith(dir));
+      assert.equal(n.dashboardPath, path.join(dir, "dashboard.md"));
       await n.close();
     });
     await withEnv({ PI_WAVE_PROGRESS: "off" }, () => {
-      assert.equal(Notifier.create(plan), null);
+      assert.equal(Notifier.create(plan, dir), null);
     });
   });
 
@@ -292,9 +285,9 @@ describe("chat push", () => {
 
   it("enables chat from the environment", async () => {
     await withEnv(
-      { PI_WAVE_PROGRESS_DIR: path.join(tmp, "p"), PI_WAVE_NOTIFY: "off", PI_WAVE_CHAT_PUSH: "on", PI_WAVE_CHAT_APP: "TestApp" },
+      { PI_WAVE_NOTIFY: "off", PI_WAVE_CHAT_PUSH: "on", PI_WAVE_CHAT_APP: "TestApp" },
       async () => {
-        const n = Notifier.create(plan)!;
+        const n = Notifier.create(plan, path.join(tmp, "p"))!;
         assert.ok(n.chat instanceof ChatPusher);
         assert.equal(n.chat.app, "TestApp");
         assert.equal(n.roleAppTmpl, "{role}");
@@ -303,9 +296,9 @@ describe("chat push", () => {
       },
     );
     await withEnv(
-      { PI_WAVE_PROGRESS_DIR: path.join(tmp, "p2"), PI_WAVE_NOTIFY: "off", PI_WAVE_CHAT_PUSH: "off" },
+      { PI_WAVE_NOTIFY: "off", PI_WAVE_CHAT_PUSH: "off" },
       async () => {
-        const n = Notifier.create(plan)!;
+        const n = Notifier.create(plan, path.join(tmp, "p2"))!;
         assert.equal(n.chat, null);
         await n.close();
       },

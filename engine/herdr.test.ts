@@ -405,8 +405,8 @@ describe("startAgent on a fresh pane", () => {
  * serves a fixed pane scrollback. */
 class SessionBackend extends HerdrBackend {
   cmd: string[] = [];
-  constructor() {
-    super("/tmp");
+  constructor(sessionDir?: string) {
+    super("/tmp", undefined, sessionDir);
   }
   protected override async runJson(args: string[]) {
     this.cmd = args;
@@ -446,6 +446,19 @@ describe("replies from pi session files", () => {
     await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
     assert.equal(b.sessionArg(), null);
     assert.equal(path.basename(b.sessionArg("--session-dir")!), "qa");
+  });
+
+  it("records sessions in the run's session dir and says where", async () => {
+    const dir = path.join(mkdtempSync(path.join(os.tmpdir(), "pi-wave-run-")), "sessions");
+    const b = new SessionBackend(dir);
+    await b.startAgent("css", "p1", "kimi-coding/k3", null, "high");
+    assert.equal(b.sessionArg(), path.join(dir, "css.jsonl"));
+    assert.equal(b.sessionFile("css"), path.join(dir, "css.jsonl"));
+    await b.startAgent("qa", "p2", "claude-sonnet-5", null, "high", { kind: "omp" });
+    assert.equal(b.sessionArg("--session-dir"), path.join(dir, "qa"));
+    assert.equal(b.sessionFile("qa"), null); // omp has not written one yet
+    const file = ompSession(path.join(dir, "qa"), user("hi"));
+    assert.equal(b.sessionFile("qa"), file);
   });
 
   it("returns only the answer to this prompt, never an earlier one", async () => {

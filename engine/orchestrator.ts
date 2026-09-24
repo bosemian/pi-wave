@@ -7,7 +7,9 @@
 // and the state is reported honestly in the summary.
 
 import { spawn } from "node:child_process";
-import { AgentTimeoutError } from "./errors.ts";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { AgentBlockedError, AgentTimeoutError } from "./errors.ts";
 import {
   type Checkpoint,
   HerdrBackend,
@@ -21,6 +23,7 @@ import {
 } from "./herdr.ts";
 import { type Assignment, type OrchestratorSpec, type Plan, resolveDisplay } from "./plan.ts";
 import { PiRpcSession, type PiRpcSessionOptions, listPiModels } from "./rpc.ts";
+import { type RunState, saveState } from "./state.ts";
 
 type Json = Record<string, any>;
 export type Emitter = (ev: Json) => void;
@@ -136,6 +139,10 @@ export const SYNTH_ROLE_SYSTEM_PROMPT =
  * every agent at once. */
 export const MAX_RESULT_CHARS = 100_000;
 export const MAX_SYNTH_RESULT_CHARS = 6000;
+/** A failed review_cmd's output as fix prompts and the summary receive it:
+ * a test run can print megabytes, but the first error and the final tally
+ * are what an agent acts on, so the middle is cut. */
+export const MAX_REVIEW_OUTPUT_CHARS = 8000;
 export const ORCH_INTERACT_TIMEOUT = 300;
 export const MAX_HERDR_AGENTS_PER_WAVE = 4;
 export const STALL_WATCH_S = 10; // pi agents boot fast; a stall usually means lost input
@@ -148,6 +155,7 @@ export const MAX_SYNC_ROUNDS = 2;
 export type HerdrLike = Pick<
   HerdrBackend,
   "splitPane" | "startAgent" | "prompt" | "checkpoint" | "reply" | "waitLateStart" | "waitSettled" | "waitDone" | "submitPending"
+  | "sessionFile"
 >;
 /** The parts of PiRpcSession the engine drives (tests pass fakes). */
 export type SessionLike = Pick<
@@ -159,7 +167,7 @@ export type SessionLike = Pick<
  * plus the run's cancellation signal. */
 export interface Deps {
   herdrAvailable: () => string | null;
-  herdrBackend: (cwd: string, signal?: AbortSignal) => HerdrLike;
+  herdrBackend: (cwd: string, signal?: AbortSignal, sessionDir?: string) => HerdrLike;
   rpcSession: (opts: PiRpcSessionOptions) => SessionLike;
   sleep: (s: number) => Promise<void>;
   /** The "provider/model" ids pi can run, or null to skip the model check. */
@@ -167,11 +175,14 @@ export interface Deps {
   /** Aborting it terminates headless agents and dispatches no further
    * prompts or waves; Herdr panes stay open, as after a normal run. */
   signal?: AbortSignal;
+  /** Where agents record their sessions (the run's sessions/); without it
+   * headless agents keep none and pane agents use a temp dir. */
+  sessionsDir?: string;
 }
 
 export const defaultDeps: Deps = {
   herdrAvailable,
-  herdrBackend: (cwd, signal) => new HerdrBackend(cwd, signal),
+  herdrBackend: (cwd, signal, sessionDir) => new HerdrBackend(cwd, signal, sessionDir),
   rpcSession: (opts) => new PiRpcSession(opts),
   sleep,
   listModels: () => listPiModels(),
@@ -191,6 +202,10 @@ export interface AgentResult {
   stats: Json;
   display: "herdr" | "headless";
   pane: string;
+  /** Kept from an earlier run of the plan instead of being run again. */
+  resumed?: boolean;
+  /** The agent's session file, when it recorded one. */
+  session?: string;
 }
 
 export function newResult(name: string, wave: number, model: string, display: AgentResult["display"]): AgentResult {
@@ -208,14 +223,17 @@ export function resultJson(r: AgentResult): Json {
     ...(r.feedback ? { feedback: r.feedback } : {}),
     ...(r.error ? { error: r.error } : {}),
     ...(r.pane ? { pane: r.pane } : {}),
+    ...(r.resumed ? { resumed: true } : {}),
+    ...(r.session ? { session: r.session } : {}),
     display: r.display,
     tokens: r.stats.tokens ?? {},
     cost: r.stats.cost ?? 0,
   };
 }
 
-/** First 'VERDICT: pass|fail' line decides; the rest is the feedback. */
-export function parseVerdict(reply: string): [boolean, string] {
+/** First 'VERDICT: pass|fail' line decides; the rest is the feedback.
+ * null when the reply has no VERDICT line. */
+export function parseVerdict(reply: string): [boolean, string] | null {
   const lines = reply.trim().split(/\r?\n/);
   for (const [i, line] of lines.entries()) {
     const low = line.trim().toLowerCase();
@@ -225,7 +243,7 @@ export function parseVerdict(reply: string): [boolean, string] {
       return [false, feedback || "orchestrator gave no specific feedback"];
     }
   }
-  return [false, `orchestrator reply had no VERDICT line:\n${reply.slice(-500)}`];
+  return null;
 }
 
 /** Cap a report, saying where it was cut and why - a reader that cannot
@@ -239,6 +257,18 @@ function clip(text: string, max: number): string {
   );
 }
 
+/** Cap command output, keeping its head and its (longer) tail. */
+function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max / 4);
+  const tail = max - head;
+  return (
+    text.slice(0, head) +
+    `\n\n[... ${text.length - max} chars of review output cut by the engine ...]\n\n` +
+    text.slice(-tail)
+  );
+}
+
 export interface SyncVerdict {
   ok: boolean;
   /** Issues to fix, by the agent that owns them. */
@@ -248,13 +278,12 @@ export interface SyncVerdict {
 }
 
 /** First 'SYNC: pass|fail' line decides; after a fail, each 'AGENT <name>:'
- * line opens that agent's block of issues. */
-export function parseSync(reply: string): SyncVerdict {
+ * line opens that agent's block of issues. null when the reply has no SYNC
+ * line. */
+export function parseSync(reply: string): SyncVerdict | null {
   const lines = reply.trim().split(/\r?\n/);
   const at = lines.findIndex((l) => l.trim().toLowerCase().startsWith("sync:"));
-  if (at === -1) {
-    return { ok: false, fixes: new Map(), note: `orchestrator reply had no SYNC line:\n${reply.slice(-500)}` };
-  }
+  if (at === -1) return null;
   if (lines[at]!.trim().slice("sync:".length).trim().toLowerCase().startsWith("pass")) {
     return { ok: true, fixes: new Map(), note: "" };
   }
@@ -333,7 +362,7 @@ export function runReview(
       // name the command last so silent checks (grep -q, test) still tell
       // the agent what failed, and the event's output tail keeps it
       const note = `review_cmd \`${reviewCmd}\` ${code === null ? `was killed by ${sig}` : `exited ${code}`}`;
-      resolve([false, out.trim() ? `${out.trimEnd()}\n${note}` : `${note} without printing anything`]);
+      resolve([false, out.trim() ? `${clipMiddle(out.trimEnd(), MAX_REVIEW_OUTPUT_CHARS)}\n${note}` : `${note} without printing anything`]);
     });
   });
 }
@@ -367,21 +396,39 @@ export class OrchestratorPane {
     });
   }
 
-  /** Judge one agent result against its done_when → [ok, feedback]. */
+  /** Judge one agent result against its done_when → [ok, feedback].
+   * Throws when the orchestrator twice fails to answer in format - its slip,
+   * which a fix round for the agent could never repair. */
   async review(a: Assignment, text: string): Promise<[boolean, string]> {
-    const reply = await this.lock.run(() =>
-      this.ask(
-        "orchestrator",
-        orchReviewTemplate(a.name, doneWhen(a), a.prompt, clip(text, MAX_RESULT_CHARS)),
-      ),
-    );
-    return parseVerdict(reply);
+    const prompt = orchReviewTemplate(a.name, doneWhen(a), a.prompt, clip(text, MAX_RESULT_CHARS));
+    const [verdict, reply] = await this.askParsed(prompt, "VERDICT", parseVerdict);
+    if (verdict) return verdict;
+    throw new Error(`orchestrator reply had no VERDICT line, asked twice:\n${reply.slice(-500)}`);
   }
 
   /** Cross-check a finished wave; see orchSyncTemplate. */
   async sync(wave: number, reports: string, owners: string, fixes: string): Promise<SyncVerdict> {
-    const reply = await this.lock.run(() => this.ask("orchestrator", orchSyncTemplate(wave, reports, owners, fixes)));
-    return parseSync(reply);
+    const prompt = orchSyncTemplate(wave, reports, owners, fixes);
+    const [verdict, reply] = await this.askParsed(prompt, "SYNC", parseSync);
+    return verdict ?? { ok: false, fixes: new Map(), note: `orchestrator reply had no SYNC line, asked twice:\n${reply.slice(-500)}` };
+  }
+
+  /** Ask the orchestrator, and once more if its reply lacks the `<marker>:`
+   * line → [parsed or null, last reply]. */
+  private askParsed<T>(prompt: string, marker: string, parse: (reply: string) => T | null): Promise<[T | null, string]> {
+    return this.lock.run(async () => {
+      let reply = await this.ask("orchestrator", prompt);
+      let parsed = parse(reply);
+      if (parsed === null) {
+        reply = await this.ask(
+          "orchestrator",
+          `Your last reply had no \`${marker}:\` line, so the engine could not read it. ` +
+            `Reply again with ONLY the ${marker} block, in exactly the format the previous prompt asked for.`,
+        );
+        parsed = parse(reply);
+      }
+      return [parsed, reply];
+    });
   }
 
   synthesize(results: Map<string, AgentResult>): Promise<string> {
@@ -488,7 +535,7 @@ async function promptHerdr(
 
 /** Map an exception from an agent run onto its result status. */
 function recordFailure(res: AgentResult, e: unknown): void {
-  res.status = e instanceof HerdrBlocked ? "blocked" : e instanceof AgentTimeoutError ? "timeout" : "error";
+  res.status = e instanceof HerdrBlocked || e instanceof AgentBlockedError ? "blocked" : e instanceof AgentTimeoutError ? "timeout" : "error";
   res.error = errMsg(e);
 }
 
@@ -570,6 +617,8 @@ export async function runAssignmentHerdr(
   } catch (e) {
     recordFailure(res, e);
   }
+  const session = backend.sessionFile(a.name);
+  if (session) res.session = session;
   // Intentionally no teardown: the pane and the agent stay open for the user.
   emit({ type: "agent_done", agent: a.name, status: res.status, rounds: res.rounds, pane: res.pane, text: res.text });
   return res;
@@ -593,6 +642,7 @@ export async function runAssignmentRpc(
     return res;
   }
   emit({ type: "agent_start", agent: a.name, wave: res.wave, model: a.model, display: "headless" });
+  if (deps.sessionsDir) res.session = path.join(deps.sessionsDir, `${a.name}.jsonl`);
   const sess = deps.rpcSession({
     agentName: a.name,
     cwd: plan.cwd,
@@ -601,6 +651,7 @@ export async function runAssignmentRpc(
     thinking: a.thinking,
     loadExtensions: a.load_extensions,
     mcpConfig: a.mcp_config,
+    sessionFile: res.session,
     onEvent: (name, ev) => emit({ agent: name, ...ev, type: "agent_progress" }),
   });
   // closing the session makes an in-flight prompt fail fast
@@ -753,7 +804,37 @@ export async function unknownModels(plan: Plan, deps: Deps): Promise<string[]> {
   return [...wanted].filter(([model]) => !known.has(model)).map(([model, who]) => `${model} (${who.join(", ")})`);
 }
 
-export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaultDeps): Promise<Json> {
+export interface RunOptions {
+  /** The run's own dir (see newRunDir): its state.json is saved after every
+   * agent and wave, and agents record their sessions in its sessions/. */
+  runDir?: string;
+  /** An earlier run of this plan: its passed agents are kept, not run again. */
+  resume?: RunState;
+}
+
+/** The passed results of an earlier run that still hold for `plan`: same
+ * wave, same assignment. An edited assignment runs again. */
+function keptResults(plan: Plan, prior: RunState): AgentResult[] {
+  if (prior.plan.cwd !== plan.cwd) {
+    throw new Error(`cannot resume in ${plan.cwd}: the earlier run ran in ${prior.plan.cwd}`);
+  }
+  const before = new Map(prior.plan.waves.flat().map((a) => [a.name, JSON.stringify(a)]));
+  return plan.waves.flatMap((wave, wIdx) =>
+    wave.flatMap((a) => {
+      const r = prior.results[a.name];
+      const same = r?.status === "pass" && r.wave === wIdx + 1 && before.get(a.name) === JSON.stringify(a);
+      return same ? [{ ...r, resumed: true }] : [];
+    }),
+  );
+}
+
+export async function orchestrate(
+  plan: Plan,
+  emit: Emitter,
+  deps: Deps = defaultDeps,
+  opts: RunOptions = {},
+): Promise<Json> {
+  const kept = opts.resume ? keptResults(plan, opts.resume) : [];
   emit({
     type: "plan_start",
     plan: plan.name,
@@ -761,15 +842,32 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
     waves: plan.waves.length,
     agents: plan.waves.reduce((n, w) => n + w.length, 0),
   });
+  if (opts.resume) emit({ type: "resumed", agents: kept.map((r) => r.name) });
+
+  const stateFile = opts.runDir && path.join(opts.runDir, "state.json");
+  const sessionsDir = opts.runDir && path.join(opts.runDir, "sessions");
+  if (sessionsDir) mkdirSync(sessionsDir, { recursive: true });
 
   // One Herdr backend for the whole run: it holds each pane agent's session
   // file, which a sync fix to an earlier wave's agent needs.
   let herdr: HerdrLike | null = null;
   const makeHerdr = deps.herdrBackend;
-  deps = { ...deps, herdrBackend: (cwd, signal) => (herdr ??= makeHerdr(cwd, signal)) };
+  deps = { ...deps, sessionsDir, herdrBackend: (cwd, signal) => (herdr ??= makeHerdr(cwd, signal, sessionsDir)) };
 
-  const results = new Map<string, AgentResult>();
+  const results = new Map<string, AgentResult>(kept.map((r) => [r.name, r]));
   const syncs = new Map<number, SyncOutcome>();
+  const state = () => ({ plan, results: Object.fromEntries(results), syncs: Object.fromEntries(syncs) });
+  // the first save must work, before anything is spent; a later failure
+  // only warns - stopping live agents over it would waste more than it saves
+  if (stateFile) saveState(stateFile, state());
+  const save = () => {
+    if (!stateFile) return;
+    try {
+      saveState(stateFile, state());
+    } catch (e) {
+      emit({ type: "state_error", error: errMsg(e) });
+    }
+  };
   let overall = "completed";
   // why the run stopped early; it also goes into the summary, which is all
   // a tool caller gets back (the stopped event only streams as an update)
@@ -812,8 +910,16 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
     }
   }
 
-  for (const [wIdx, wave] of unknown.length ? [] : plan.waves.entries()) {
+  for (const [wIdx, allOfWave] of unknown.length ? [] : plan.waves.entries()) {
     deps.signal?.throwIfAborted();
+    // on a resume, only what did not pass runs; a wave that passed and
+    // synced is done, one whose sync failed only syncs again
+    const wave = allOfWave.filter((a) => !results.has(a.name));
+    const priorSync = opts.resume?.syncs[wIdx];
+    if (!wave.length && priorSync?.status !== "fail") {
+      if (priorSync) syncs.set(wIdx, priorSync);
+      continue;
+    }
     // delegate-wave skill: 4 agents per wave in herdr mode - the assignment
     // row fills right (see PaneLayout), so too many panes in one wave still
     // make unusably narrow columns (observed: the last-split agent
@@ -829,17 +935,20 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
       break;
     }
     emit({ type: "wave_start", wave: wIdx + 1, agents: wave.map((a) => a.name) });
-    const outcomes = await Promise.all(
-      wave.map((a) => runAssignment(a, wIdx, plan, results, emit, orch, layout, deps)),
+    await Promise.all(
+      wave.map(async (a) => {
+        results.set(a.name, await runAssignment(a, wIdx, plan, results, emit, orch, layout, deps));
+        save();
+      }),
     );
-    for (const r of outcomes) results.set(r.name, r);
-    let waveOk = outcomes.every((r) => r.status === "pass");
+    let waveOk = allOfWave.every((a) => results.get(a.name)?.status === "pass");
     // a lone first wave has nothing to agree with yet
-    if (orch && waveOk && (wave.length > 1 || wIdx > 0)) {
+    if (orch && waveOk && (allOfWave.length > 1 || wIdx > 0)) {
       const sync = await syncWave(wIdx, plan, results, orch, deps.herdrBackend(plan.cwd, deps.signal), emit, deps);
       syncs.set(wIdx, sync);
       waveOk = sync.status === "pass";
     }
+    save();
     emit({ type: "wave_done", wave: wIdx + 1, passed: waveOk });
     if (!waveOk && plan.on_failure === "stop") {
       stop("wave failed and plan.on_failure is 'stop'; later waves were not dispatched");
@@ -851,6 +960,7 @@ export async function orchestrate(plan: Plan, emit: Emitter, deps: Deps = defaul
     type: "summary",
     plan: plan.name,
     cwd: plan.cwd,
+    ...(opts.runDir ? { run_dir: opts.runDir } : {}),
     status: overall,
     ...(stopReason ? { reason: stopReason } : {}),
     waves: plan.waves.map((wave, i) => ({

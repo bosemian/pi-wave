@@ -4,15 +4,13 @@
 // in the extension); this module adds two human-facing side channels fed
 // from the same events:
 //
-// - a run directory ~/.pi-wave/progress/<plan>-<timestamp>/ with
-//   dashboard.md (compact, always-current per-role overview, rewritten
+// - in the run's dir (see state.ts): dashboard.md (compact, always-current per-role overview, rewritten
 //   atomically on every event - built for pull-reading, e.g. by a desktop
 //   bot) and events.jsonl (every raw event, including full agent texts)
 // - macOS notifications on agent_done / review_failed / wave_done / summary
 //
 // Both sinks are best-effort: any failure prints to stderr and never stops
 // the run. Env knobs: PI_WAVE_PROGRESS=off disables the files,
-// PI_WAVE_PROGRESS_DIR moves them (default ~/.pi-wave/progress),
 // PI_WAVE_NOTIFY=off disables notifications (default on under darwin).
 //
 // An optional third sink (opt-in, PI_WAVE_CHAT_PUSH=on) pushes one-line
@@ -26,16 +24,7 @@
 // bare role name). Run-level digests go to PI_WAVE_CHAT_APP.
 
 import { spawn } from "node:child_process";
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  renameSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import os from "node:os";
+import { appendFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Assignment, Plan } from "./plan.ts";
 
@@ -52,19 +41,14 @@ export const EMOJI: Record<string, string> = {
 const DETAIL_CHARS = 200;
 const LOG_LINES = 60;
 const SUMMARY_CHARS = 280;
-const DEFAULT_PROGRESS_DIR = "~/.pi-wave/progress";
 export const DEFAULT_CHAT_EVENTS = ["plan_start", "review_failed", "agent_done", "wave_done", "summary"];
 
 const OFF = ["off", "0", "no", "false"];
 const ON = ["on", "1", "yes", "true"];
 
-const expandUser = (p: string) =>
-  p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
-
 const pad = (n: number) => String(n).padStart(2, "0");
 const ymd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const hms = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-const stampOf = (d: Date) => `${ymd(d).replaceAll("-", "")}-${hms(d).replaceAll(":", "")}`;
 
 class RoleRow {
   wave: number | string;
@@ -277,7 +261,6 @@ export class Notifier {
   readonly roleAppTmpl: string;
   readonly roleUrlTmpl: string;
   private readonly plan: Plan;
-  private readonly runDir: string;
   private readonly eventsPath: string;
   private readonly mac: MacSink | null;
   private readonly chatEvents: Set<string>;
@@ -294,7 +277,6 @@ export class Notifier {
 
   constructor(plan: Plan, runDir: string, opts: NotifierOptions = {}) {
     this.plan = plan;
-    this.runDir = runDir;
     this.dashboardPath = path.join(runDir, "dashboard.md");
     this.eventsPath = path.join(runDir, "events.jsonl");
     this.mac = opts.mac ?? null;
@@ -305,18 +287,13 @@ export class Notifier {
     this.roleUrlTmpl = opts.roleUrlTmpl ?? "";
     this.assign = new Map(plan.waves.flat().map((a) => [a.name, a]));
     mkdirSync(runDir, { recursive: true });
-    this.pointLatest();
   }
 
   // -- construction ---------------------------------------------------
 
-  static create(plan: Plan, warn: (msg: string) => void = stderrWarn): Notifier | null {
+  static create(plan: Plan, runDir: string, warn: (msg: string) => void = stderrWarn): Notifier | null {
     const env = process.env;
     if (OFF.includes((env.PI_WAVE_PROGRESS ?? "").toLowerCase())) return null;
-    const base = expandUser(env.PI_WAVE_PROGRESS_DIR ?? DEFAULT_PROGRESS_DIR);
-    const stamp = stampOf(new Date());
-    let runDir = path.join(base, `${plan.name}-${stamp}`);
-    for (let n = 2; existsSync(runDir); n++) runDir = path.join(base, `${plan.name}-${stamp}-${n}`);
     const setting = (env.PI_WAVE_NOTIFY ?? "auto").toLowerCase();
     const useMac = setting === "auto" ? process.platform === "darwin" : !OFF.includes(setting);
     let chat: ChatPusher | null = null;
@@ -498,23 +475,6 @@ export class Notifier {
     const tmp = this.dashboardPath + ".tmp";
     writeFileSync(tmp, this.render());
     renameSync(tmp, this.dashboardPath);
-  }
-
-  private pointLatest(): void {
-    const base = path.dirname(this.runDir);
-    const latest = path.join(base, "latest");
-    const tmp = path.join(base, `.latest-${process.pid}`);
-    try {
-      symlinkSync(path.basename(this.runDir), tmp);
-      renameSync(tmp, latest);
-    } catch {
-      try {
-        rmSync(tmp, { force: true });
-        writeFileSync(latest, this.runDir + "\n");
-      } catch {
-        // best-effort pointer only
-      }
-    }
   }
 
   private render(): string {

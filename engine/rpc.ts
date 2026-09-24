@@ -11,7 +11,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AgentTimeoutError } from "./errors.ts";
+import { AgentBlockedError, AgentTimeoutError } from "./errors.ts";
 
 type Json = Record<string, any>;
 export type EventHook = (agentName: string, ev: Json) => void;
@@ -77,12 +77,17 @@ export interface PiRpcSessionOptions {
   thinking?: string;
   loadExtensions?: boolean;
   mcpConfig?: string;
+  /** Record the session to this file; without one pi keeps no session. */
+  sessionFile?: string;
   onEvent?: EventHook;
   /** Executable to spawn; tests point this at a fake pi. */
   piBin?: string;
 }
 
 const PROCESS_EXIT = "__process_exit__";
+/** Extension UI calls that block the agent until answered (the rest are
+ * fire-and-forget notices). */
+const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
 /** Unbounded FIFO of events with a timed async get(). */
 class EventQueue {
@@ -148,8 +153,9 @@ export class PiRpcSession {
   // -- lifecycle ----------------------------------------------------------
 
   async start(): Promise<Json> {
-    const { model, provider, thinking = "high", loadExtensions = false, mcpConfig = "" } = this.opts;
-    const argv = ["--mode", "rpc", "--no-session", "--model", model, "--thinking", thinking];
+    const { model, provider, thinking = "high", loadExtensions = false, mcpConfig = "", sessionFile } = this.opts;
+    const session = sessionFile ? ["--session", sessionFile] : ["--no-session"];
+    const argv = ["--mode", "rpc", ...session, "--model", model, "--thinking", thinking];
     if (provider) argv.push("--provider", provider);
     // Recursion guard: assignment agents must never load dispatch_wave
     // (soft rule in prompts, hard guarantee here).
@@ -242,6 +248,9 @@ export class PiRpcSession {
    * compaction retry, or queued continuation remains). */
   async promptAndSettle(message: string, timeoutS: number): Promise<void> {
     if (this.proc === null) throw new PiRpcError(`[${this.agentName}] session not started`);
+    // this prompt's text only: a round without an assistant message must
+    // fall back to pi, never to the previous round's report
+    this.lastTextCache = null;
     await this.request({ type: "prompt", message }, 30);
     const deadline = performance.now() + timeoutS * 1000;
     while (true) {
@@ -258,6 +267,13 @@ export class PiRpcSession {
       if (ev === null) continue;
       this.absorbEvent(ev);
       if (ev.type === "agent_settled") return;
+      // a dialog blocks the agent until someone answers; nobody is there
+      // (load_extensions), and answering for the user is not ours to do
+      if (ev.type === "extension_ui_request" && DIALOG_METHODS.has(ev.method)) {
+        throw new AgentBlockedError(
+          `[${this.agentName}] an extension is waiting for an answer (${ev.method}: ${ev.title ?? ""})`,
+        );
+      }
     }
   }
 

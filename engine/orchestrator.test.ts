@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { AgentTimeoutError } from "./errors.ts";
+import { AgentBlockedError, AgentTimeoutError } from "./errors.ts";
 import { HerdrBackend, HerdrPromptStalled } from "./herdr.ts";
 import {
   type Deps,
@@ -24,6 +24,7 @@ import {
   runReview,
 } from "./orchestrator.ts";
 import { type OrchestratorSpec, loadPlan } from "./plan.ts";
+import { loadState } from "./state.ts";
 
 type Json = Record<string, any>;
 
@@ -60,7 +61,7 @@ class RecordingBackend {
     return { scrollback: "", prompts: 0, replies: 0, busy: false };
   }
   async reply() {
-    return "ok";
+    return "VERDICT: pass";
   }
 }
 
@@ -131,10 +132,35 @@ describe("parseVerdict", () => {
   it("returns the feedback after a fail", () => {
     assert.deepEqual(parseVerdict("VERDICT: fail\n- add tests\n- fix typo"), [false, "- add tests\n- fix typo"]);
   });
-  it("fails without a VERDICT line", () => {
-    const [ok, feedback] = parseVerdict("looks fine to me");
-    assert.equal(ok, false);
-    assert.ok(feedback.includes("no VERDICT line"));
+  it("returns null without a VERDICT line", () => {
+    assert.equal(parseVerdict("looks fine to me"), null);
+  });
+});
+
+describe("orchestrator reply without a VERDICT line", () => {
+  // the orchestrator's format slip must not cost the agent a fix round
+  const plan = () => writePlan({
+    orchestrator: true,
+    waves: [[{ name: "writer", prompt: "p", model: "kimi-coding/k3", files: ["a.txt"], display: "herdr" }]],
+  });
+  const run = async (orchestrator: string[]) => {
+    const herdr = new ScriptedHerdr({ orchestrator });
+    const summary = await orchestrate(plan(), () => {}, fakeDeps({ herdrBackend: () => herdr }));
+    return { herdr, agent: summary.waves[0].agents[0] };
+  };
+
+  it("asks the orchestrator again and uses its second reply", async () => {
+    const { herdr, agent } = await run(["looks fine to me", "VERDICT: pass"]);
+    assert.equal(agent.status, "pass");
+    assert.equal(herdr.sentTo("writer").length, 1); // no fix round
+    assert.match(herdr.sentTo("orchestrator")[1]!, /no `VERDICT:` line/);
+  });
+
+  it("blames the orchestrator, not the agent, when it never answers in format", async () => {
+    const { herdr, agent } = await run(["looks fine", "still fine"]);
+    assert.equal(agent.status, "error");
+    assert.match(agent.error, /orchestrator reply had no VERDICT line/);
+    assert.equal(herdr.sentTo("writer").length, 1);
   });
 });
 
@@ -187,6 +213,8 @@ class FakeHerdrBackend implements HerdrLike {
   async waitDone(_n: string, _s: unknown, timeoutS: number, bootS: number) {
     this.waitDoneArgs = [timeoutS, bootS];
     if (this.done) throw this.done;
+  }  sessionFile() {
+    return null;
   }
 }
 
@@ -485,6 +513,34 @@ describe("headless assignment", () => {
     assert.equal(events.find((e) => e.type === "review_failed")!.review_output_tail, note);
   });
 
+  it("cuts a huge review output to its head and tail before the fix round", async () => {
+    const noisy = "echo FIRST-ERROR; head -c 300000 /dev/zero | tr '\\0' x; echo; echo LAST-SUMMARY; exit 1";
+    const plan = writePlan({
+      waves: [[{ name: "noisy", prompt: "p", model: "kimi-coding/k3", files: ["a.txt"], review_cmd: noisy, max_fix_rounds: 1 }]],
+    });
+    const sess = fakeSession("tried");
+    const res = await runAssignmentRpc(plan.waves[0]![0]!, 0, plan, new Map(), () => {},
+      fakeDeps({ rpcSession: () => sess as unknown as SessionLike }));
+    const fix = sess.prompts[1]!;
+    assert.ok(fix.length < 20_000, `fix prompt is ${fix.length} chars`);
+    assert.ok(fix.includes("FIRST-ERROR") && fix.includes("LAST-SUMMARY"));
+    assert.match(fix, /chars of review output cut by the engine/);
+    assert.ok(fix.includes(`review_cmd \`${noisy}\` exited 1`));
+    assert.ok(res.feedback.length < 20_000);
+  });
+
+  it("reports an agent stuck at an extension dialog as blocked", async () => {
+    const plan = writePlan({ waves: [[{ name: "ext", prompt: "p", model: "kimi-coding/k3", load_extensions: true }]] });
+    const sess = fakeSession("");
+    sess.promptAndSettle = async () => {
+      throw new AgentBlockedError("[ext] an extension is waiting for an answer (confirm: Allow?)");
+    };
+    const res = await runAssignmentRpc(plan.waves[0]![0]!, 0, plan, new Map(), () => {},
+      fakeDeps({ rpcSession: () => sess as unknown as SessionLike }));
+    assert.equal(res.status, "blocked");
+    assert.ok(sess.closed);
+  });
+
   it("refuses kind=omp without a pane", async () => {
     const plan = writePlan({
       waves: [[{ name: "qa", prompt: "p", model: "claude-sonnet-5", kind: "omp", display: "headless" }]],
@@ -657,20 +713,18 @@ describe("long agent reports", () => {
 
 describe("parseSync", () => {
   it("passes on SYNC: pass", () => {
-    assert.equal(parseSync("checked everything\nSYNC: PASS").ok, true);
+    assert.equal(parseSync("checked everything\nSYNC: PASS")!.ok, true);
   });
 
   it("splits a fail into per-agent issues and an unaddressed note", () => {
-    const v = parseSync("SYNC: fail\noverall the contract drifted\nAGENT css:\n- use #hero\nAGENT js: - read data-count\n- guard null");
+    const v = parseSync("SYNC: fail\noverall the contract drifted\nAGENT css:\n- use #hero\nAGENT js: - read data-count\n- guard null")!;
     assert.equal(v.ok, false);
     assert.deepEqual([...v.fixes], [["css", "- use #hero"], ["js", "- read data-count\n- guard null"]]);
     assert.equal(v.note, "overall the contract drifted");
   });
 
-  it("fails without a SYNC line", () => {
-    const v = parseSync("looks good");
-    assert.equal(v.ok, false);
-    assert.ok(v.note.includes("no SYNC line"));
+  it("returns null without a SYNC line", () => {
+    assert.equal(parseSync("looks good"), null);
   });
 });
 
@@ -706,6 +760,9 @@ class ScriptedHerdr implements HerdrLike {
   }
   async waitSettled() {}
   async waitDone() {}
+  sessionFile() {
+    return null;
+  }
   sentTo(name: string) {
     return this.prompts.filter((p) => p.name === name).map((p) => p.text);
   }
@@ -788,6 +845,24 @@ describe("wave sync", () => {
     assert.equal(summary.waves[1].sync.status, "fail");
   });
 
+  it("asks again when the orchestrator's reply has no SYNC line", async () => {
+    const plan = writePlan({ orchestrator: true, waves: [[builder("html"), builder("css")]] });
+    const herdr = new ScriptedHerdr({ orchestrator: ["all consistent", "SYNC: pass"] });
+    const { summary } = await run(plan, herdr);
+    assert.match(herdr.sentTo("orchestrator")[1]!, /no `SYNC:` line/);
+    assert.deepEqual(summary.waves[0].sync, { status: "pass", rounds: 0 });
+    assert.equal(summary.status, "completed");
+  });
+
+  it("fails the sync, not the agents, when the orchestrator never answers in format", async () => {
+    const plan = writePlan({ orchestrator: true, waves: [[builder("html"), builder("css")]] });
+    const herdr = new ScriptedHerdr({ orchestrator: ["all consistent", "really"] });
+    const { summary } = await run(plan, herdr);
+    assert.equal(summary.waves[0].sync.status, "fail");
+    assert.match(summary.waves[0].sync.issues, /no SYNC line/);
+    assert.ok(summary.waves[0].agents.every((a: Json) => a.status === "pass"));
+  });
+
   it("skips the sync without an orchestrator", async () => {
     const plan = writePlan({ waves: [[builder("html"), builder("css")]] });
     const { events, summary } = await run(plan, new ScriptedHerdr());
@@ -795,3 +870,162 @@ describe("wave sync", () => {
     assert.equal(summary.waves[0].sync, undefined);
   });
 });
+
+describe("resume", () => {
+  const runDir = () => mkdtempSync(path.join(os.tmpdir(), "pi-wave-run-"));
+  const stateOf = (dir: string) => loadState(path.join(dir, "state.json"));
+  const planWith = (cwd: string, over: Json = {}) => loadPlanIn(cwd, {
+    waves: [
+      [{ name: "design", prompt: "write the spec", model: "kimi-coding/k3", files: [] }],
+      [{ name: "build", prompt: "build it", model: "kimi-coding/k3", files: ["a.txt"], needs_results: ["design"],
+        review_cmd: "exit 1", max_fix_rounds: 0 }],
+    ],
+    ...over,
+  });
+  /** Headless sessions per agent, each answering `<name> result`. */
+  const sessions = () => {
+    const made = new Map<string, ReturnType<typeof fakeSession>>();
+    const deps = fakeDeps({
+      rpcSession: (o) => {
+        const s = fakeSession(`${o.agentName} result`);
+        made.set(o.agentName, s);
+        return s as unknown as SessionLike;
+      },
+    });
+    return { made, deps };
+  };
+
+  it("runs only what did not pass, with earlier results still reaching later waves", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    const first = sessions();
+    const stopped = await orchestrate(planWith(cwd), () => {}, first.deps, { runDir: dir });
+    assert.equal(stopped.status, "stopped");
+
+    // the user fixes the failing check, then resumes
+    const fixed = planWith(cwd);
+    fixed.waves[1]![0]!.review_cmd = "true";
+    const second = sessions();
+    const events: Json[] = [];
+    const next = runDir();
+    const summary = await orchestrate(fixed, (e) => events.push(e), second.deps, { runDir: next, resume: stateOf(dir) });
+    assert.deepEqual([...second.made.keys()], ["build"]); // design is not run again
+    assert.ok(second.made.get("build")!.prompts[0]!.includes("design result"));
+    assert.equal(summary.status, "completed");
+    const design = summary.waves[0].agents[0];
+    assert.equal(design.resumed, true);
+    assert.equal(design.cost, 0.5); // cost of the first run is kept
+    assert.deepEqual(events.find((e) => e.type === "resumed")!.agents, ["design"]);
+    // the resumed run's own state holds everything, so it can be resumed in turn
+    const state = stateOf(next);
+    assert.equal(state.results.build!.status, "pass");
+    assert.equal(state.results.design!.session, path.join(dir, "sessions", "design.jsonl"));
+  });
+
+  it("records every agent's session in the run dir and names the dir in the summary", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    const opened: (string | undefined)[] = [];
+    const deps = fakeDeps({
+      rpcSession: (o) => {
+        opened.push(o.sessionFile);
+        return fakeSession("done") as unknown as SessionLike;
+      },
+    });
+    const summary = await orchestrate(planWith(cwd), () => {}, deps, { runDir: dir });
+    const sessionsDir = path.join(dir, "sessions");
+    assert.deepEqual(opened, [path.join(sessionsDir, "design.jsonl"), path.join(sessionsDir, "build.jsonl")]);
+    assert.equal(summary.run_dir, dir);
+    assert.equal(summary.waves[0].agents[0].session, path.join(sessionsDir, "design.jsonl"));
+  });
+
+  it("runs an edited assignment again even when it passed", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    await orchestrate(planWith(cwd), () => {}, sessions().deps, { runDir: dir });
+    const edited = planWith(cwd);
+    edited.waves[0]![0]!.prompt = "write a better spec";
+    const second = sessions();
+    await orchestrate(edited, () => {}, second.deps, { runDir: runDir(), resume: stateOf(dir) });
+    assert.deepEqual([...second.made.keys()], ["design", "build"]);
+  });
+
+  it("keeps the agents that finished when the run is aborted mid-wave", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    const plan = loadPlanIn(cwd, {
+      waves: [[
+        { name: "quick", prompt: "p", model: "kimi-coding/k3", files: [] },
+        { name: "slow", prompt: "p", model: "kimi-coding/k3", files: [] },
+      ]],
+    });
+    const abort = new AbortController();
+    const deps = fakeDeps({
+      signal: abort.signal,
+      rpcSession: (o) => {
+        const s = fakeSession("done");
+        if (o.agentName === "slow") {
+          // Esc arrives while slow works, after quick has finished
+          s.promptAndSettle = async () => {
+            await new Promise((r) => setTimeout(r, 20));
+            abort.abort();
+            throw new Error("aborted");
+          };
+        }
+        return s as unknown as SessionLike;
+      },
+    });
+    await assert.rejects(orchestrate(plan, () => {}, deps, { runDir: dir }));
+    const state = stateOf(dir);
+    assert.equal(state.results.quick!.status, "pass");
+    assert.notEqual(state.results.slow?.status, "pass");
+  });
+
+  it("only repeats the sync of a wave whose agents all passed", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    const agent = (name: string) => ({ name, prompt: "p", model: "kimi-coding/k3", files: [`${name}.txt`], display: "herdr", review_cmd: "true" });
+    const plan = () => loadPlanIn(cwd, { orchestrator: true, waves: [[agent("html"), agent("css")]] });
+    const off = new ScriptedHerdr({ orchestrator: ["no idea", "still no idea"] }); // no SYNC line, twice
+    const stopped = await orchestrate(plan(), () => {}, fakeDeps({ herdrBackend: () => off }), { runDir: dir });
+    assert.equal(stopped.waves[0].sync.status, "fail");
+
+    const herdr = new ScriptedHerdr({ orchestrator: ["SYNC: pass"] });
+    const summary = await orchestrate(plan(), () => {}, fakeDeps({ herdrBackend: () => herdr }), { runDir: runDir(), resume: stateOf(dir) });
+    assert.equal(herdr.sentTo("html").length + herdr.sentTo("css").length, 0);
+    assert.equal(summary.waves[0].sync.status, "pass");
+    assert.equal(summary.status, "completed");
+  });
+
+  it("skips a wave that passed and synced", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"));
+    const dir = runDir();
+    const plan = () => loadPlanIn(cwd, { waves: [[{ name: "done", prompt: "p", model: "kimi-coding/k3", files: [] }]] });
+    await orchestrate(plan(), () => {}, sessions().deps, { runDir: dir });
+    const second = sessions();
+    const events: Json[] = [];
+    const summary = await orchestrate(plan(), (e) => events.push(e), second.deps, { runDir: runDir(), resume: stateOf(dir) });
+    assert.equal(second.made.size, 0);
+    assert.equal(count(events, "wave_start"), 0);
+    assert.equal(summary.status, "completed");
+  });
+
+  it("refuses to resume in a different directory", async () => {
+    const dir = runDir();
+    await orchestrate(planWith(mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"))), () => {}, sessions().deps, { runDir: dir });
+    const elsewhere = sessions();
+    await assert.rejects(
+      orchestrate(planWith(mkdtempSync(path.join(os.tmpdir(), "pi-wave-proj-"))), () => {}, elsewhere.deps,
+        { runDir: runDir(), resume: stateOf(dir) }),
+      /cannot resume .* ran in /,
+    );
+    assert.equal(elsewhere.made.size, 0);
+  });
+});
+
+/** loadPlan for a plan whose agents work in `cwd`. */
+function loadPlanIn(cwd: string, p: Json) {
+  const f = path.join(mkdtempSync(path.join(os.tmpdir(), "pi-wave-plan-")), "plan.json");
+  writeFileSync(f, JSON.stringify({ name: "t", cwd, ...p }));
+  return loadPlan(f);
+}
